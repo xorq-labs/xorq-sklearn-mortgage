@@ -57,10 +57,183 @@
       # This is an additional overlay implementing build fixups.
       # See:
       # - https://pyproject-nix.github.io/uv2nix/FAQ.html
-      pyprojectOverrides = _final: _prev: {
-        # Implement build fixups here.
-        # Note that uv2nix is _not_ using Nixpkgs buildPythonPackage.
-        # It's using https://pyproject-nix.github.io/pyproject.nix/build.html
+      pyprojectOverrides = final: prev: {
+        # Build system dependencies for cityhash
+        cityhash = prev.cityhash.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ final.resolveBuildSystem {
+              setuptools = [];
+              wheel = [];
+            };
+        });
+
+        # Scientific computing packages
+        scikit-learn = prev.scikit-learn.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [
+              final.meson-python
+              final.ninja
+              final.cython
+              final.numpy
+              final.scipy
+              final.packaging
+              final.pyproject-metadata
+              final.gast
+              pkgs.pkg-config
+              pkgs.openblas
+              pkgs.meson
+            ];
+        });
+
+        scipy = prev.scipy.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [
+              final.meson-python
+              final.ninja
+              final.cython
+              final.numpy
+              final.pybind11
+              final.pythran
+              final.packaging
+              final.pyproject-metadata
+              final.gast
+              final.beniget
+              final.ply
+            ];
+
+          buildInputs =
+            (old.buildInputs or [])
+            ++ [
+              pkgs.gfortran
+              pkgs.cmake
+              pkgs.xsimd
+              pkgs.pkg-config
+              pkgs.openblas
+              pkgs.meson
+              pkgs.lapack
+            ];
+        });
+
+        # Google packages
+        google-crc32c = prev.google-crc32c.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ final.resolveBuildSystem {
+              setuptools = [];
+              wheel = [];
+            };
+        });
+
+        # Data processing packages
+        pyarrow = prev.pyarrow.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [
+              final.setuptools
+              final.cython
+              final.numpy
+              pkgs.cmake
+              pkgs.pkg-config
+            ];
+          buildInputs =
+            (old.buildInputs or [])
+            ++ [
+              pkgs.arrow-cpp
+              pkgs.lz4
+            ];
+        });
+
+        # Machine learning packages
+        xgboost = prev.xgboost.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [pkgs.cmake]
+            ++ final.resolveBuildSystem (
+              pkgs.lib.listToAttrs (map (name: pkgs.lib.nameValuePair name []) ["hatchling"])
+            );
+        });
+
+        # Custom package override for xorq
+        xorq = prev.xorq.overrideAttrs (old: {
+          src = ./dist/xorq-0.3.0-py3-none-any.whl;
+          format = "wheel";
+
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ final.resolveBuildSystem {
+              setuptools = [];
+              wheel = [];
+            };
+          buildInputs = (old.buildInputs or []) ++ [pkgs.openssl];
+        });
+
+        # Network/RPC packages
+        grpcio = prev.grpcio.overrideAttrs (old: {
+          NIX_CFLAGS_COMPILE =
+            (old.NIX_CFLAGS_COMPILE or "")
+            + " -DTARGET_OS_OSX=1 -D_DARWIN_C_SOURCE"
+            + " -I${pkgs.zlib.dev}/include"
+            + " -I${pkgs.openssl.dev}/include"
+            + " -I${pkgs.c-ares.dev}/include";
+
+          NIX_LDFLAGS =
+            (old.NIX_LDFLAGS or "")
+            + " -L${pkgs.zlib.out}/lib -lz"
+            + " -L${pkgs.openssl.out}/lib -lssl -lcrypto"
+            + " -L${pkgs.c-ares.out}/lib -lcares";
+
+          buildInputs =
+            (old.buildInputs or [])
+            ++ [
+              pkgs.zlib
+              pkgs.openssl
+              pkgs.c-ares
+            ];
+
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [
+              pkgs.pkg-config
+              pkgs.cmake
+            ];
+
+          # Environment variables for grpcio build
+          GRPC_PYTHON_BUILD_SYSTEM_OPENSSL = "1";
+          GRPC_PYTHON_BUILD_SYSTEM_ZLIB = "1";
+          GRPC_PYTHON_BUILD_SYSTEM_CARES = "1";
+
+          preBuild = ''
+            export PYTHONPATH=${final.setuptools}/${python.sitePackages}:$PYTHONPATH
+          '';
+        });
+
+        # Database packages
+        duckdb = prev.duckdb.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [
+              final.setuptools
+              final.pybind11
+              final.wheel
+              pkgs.cmake
+            ];
+          buildInputs = (old.buildInputs or []) ++ [pkgs.openssl];
+        });
+
+        psycopg2-binary = prev.psycopg2-binary.overrideAttrs (old: {
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ [
+              final.setuptools
+              final.wheel
+              pkgs.postgresql.pg_config
+              pkgs.postgresql
+            ];
+          buildInputs = (old.buildInputs or []) ++ [pkgs.openssl];
+        });
       };
 
       # This example is only using x86_64-linux

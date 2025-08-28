@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "ipython>=9.4.0",
     "urllib3>=2.2.3",
+    "xorq>=0.3.0",
 ]
 
 [project.scripts]
@@ -19,3 +21,5 @@ build-backend = "hatchling.build"
 dev = [
     "ruff>=0.6.7",
 ]
+[tool.uv.sources]
+xorq = {path = "dist/xorq-0.3.0-py3-none-any.whl"}
