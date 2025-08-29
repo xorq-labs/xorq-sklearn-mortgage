@@ -68,54 +68,6 @@
             };
         });
 
-        # Scientific computing packages
-        scikit-learn = prev.scikit-learn.overrideAttrs (old: {
-          nativeBuildInputs =
-            (old.nativeBuildInputs or [])
-            ++ [
-              final.meson-python
-              final.ninja
-              final.cython
-              final.numpy
-              final.scipy
-              final.packaging
-              final.pyproject-metadata
-              final.gast
-              pkgs.pkg-config
-              pkgs.openblas
-              pkgs.meson
-            ];
-        });
-
-        scipy = prev.scipy.overrideAttrs (old: {
-          nativeBuildInputs =
-            (old.nativeBuildInputs or [])
-            ++ [
-              final.meson-python
-              final.ninja
-              final.cython
-              final.numpy
-              final.pybind11
-              final.pythran
-              final.packaging
-              final.pyproject-metadata
-              final.gast
-              final.beniget
-              final.ply
-            ];
-
-          buildInputs =
-            (old.buildInputs or [])
-            ++ [
-              pkgs.gfortran
-              pkgs.cmake
-              pkgs.xsimd
-              pkgs.pkg-config
-              pkgs.openblas
-              pkgs.meson
-              pkgs.lapack
-            ];
-        });
 
         # Google packages
         google-crc32c = prev.google-crc32c.overrideAttrs (old: {
