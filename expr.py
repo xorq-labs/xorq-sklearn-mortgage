@@ -1,10 +1,18 @@
+import pickle
 import pathlib
 import os
+import tempfile
 import time
+from typing import Optional, Tuple, List, Dict, Any, Callable, Union
+from functools import singledispatch, partial
+
 import pandas as pd
+import xgboost as xgb
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.metrics import classification_report, roc_auc_score
+from toolz import curry, pipe
+from attrs import frozen, evolve, field
 
 import xorq.api as xo
 from xorq.api import selectors as s
@@ -14,30 +22,186 @@ from xorq.expr.ml.fit_lib import transform_sklearn_feature_names_out
 from xorq.expr.ml.pipeline_lib import FittedPipeline, Step
 from xorq.expr.ml.structer import ENCODED
 from xorq.caching import ParquetStorage
-
-# Setup paths and connection
-data_root = pathlib.Path(os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))
-con = xo.connect()
-
-duck_con = xo.duckdb.connect()
-
-# Load and join data
-perf_expr = xo.deferred_read_parquet(str(data_root / "data" / "perf/perf.parquet"), duck_con, "perf_raw")
-acq_expr = xo.deferred_read_parquet(str(data_root / "data" / "acq/acq.parquet"), duck_con, "acq_raw")
-joined_expr = acq_expr.join(perf_expr,acq_expr.loan_id==perf_expr.loan_id, how="left").filter(xo._.monthly_reporting_period<="2001-01-01")
-
-dup_cols = [c for c in joined_expr.columns if c != 'loan_id' and c.startswith('loan_id')]
-if dup_cols:
-    joined_expr = joined_expr.drop(*dup_cols)
+from xorq.ml import make_quickgrove_udf, rewrite_quickgrove_expr
 
 
-cache_storage = ParquetStorage(source=con)
+@frozen
+class DataConfig:
+    data_root: pathlib.Path = field(converter=pathlib.Path)
+    perf_path: str = field(default="data/perf/perf.parquet")
+    acq_path: str = field(default="data/acq/acq.parquet")
+    filter_date: str = field(default="2001-01-01")
+    
+    def with_data_root(self, data_root: Union[str, pathlib.Path]) -> 'DataConfig':
+        return evolve(self, data_root=pathlib.Path(data_root))
 
+
+@frozen
+class FeatureConfig:
+    numeric_features: Tuple[str, ...] = field(default=(
+        'orig_rate', 'orig_ltv', 'dti', 'credit_score', 
+        'orig_upb', 'current_balance_ratio'
+    ))
+    categorical_features: Tuple[str, ...] = field(default=(
+        'property_state', 'loan_purpose', 'property_type'
+    ))
+    flag_features: Tuple[str, ...] = field(default=(
+        'high_ltv_flag', 'high_dti_flag', 'subprime_flag'
+    ))
+    target_col: str = field(default='ever_90_delinq')
+    
+    @property
+    def all_features(self) -> Tuple[str, ...]:
+        return self.numeric_features + self.categorical_features + self.flag_features
+
+
+@frozen
+class ModelConfig:
+    num_boost_round: int = field(default=100)
+    max_depth: int = field(default=6)
+    eta: float = field(default=0.1)
+    objective: str = field(default='binary:logistic')
+    eval_metric: str = field(default='logloss')
+    seed: int = field(default=42)
+    prediction_threshold: float = field(default=0.5)
+    
+    @property
+    def params(self) -> Dict[str, Any]:
+        return {
+            'max_depth': self.max_depth,
+            'eta': self.eta,
+            'objective': self.objective,
+            'eval_metric': self.eval_metric,
+            'seed': self.seed
+        }
+
+
+@frozen
+class PipelineConfig:
+    data: DataConfig = field(factory=DataConfig)
+    features: FeatureConfig = field(factory=FeatureConfig)
+    model: ModelConfig = field(factory=ModelConfig)
+    test_size: float = field(default=0.5)
+    random_seed: int = field(default=42)
+
+
+@frozen
+class ConnectionContext:
+    con: Any = field()
+    duck_con: Any = field()
+    
+    @classmethod
+    def create(cls) -> 'ConnectionContext':
+        return cls(
+            con=xo.connect(),
+            duck_con=xo.duckdb.connect()
+        )
+
+
+@frozen
+class MLPipelineResult:
+    train_expr: Any = field()
+    test_expr: Any = field()
+    fitted_pipeline: FittedPipeline = field()
+    predictions: Any = field()
+    model: Any = field()
+    deferred_model: Any = field(default=None)
+
+
+def xgboost_to_quickgrove(booster: "xgb.Booster", feature_names: list = None, cleanup_temp_file: bool = True):
+    try:
+        import xgboost as xgb
+        import quickgrove
+    except ImportError as e:
+        missing_lib = "xgboost" if "xgboost" in str(e) else "quickgrove"
+        raise ImportError(f"Required library '{missing_lib}' is not installed. Please install it with: pip install {missing_lib}") from e
+    
+    if not isinstance(booster, xgb.Booster):
+        raise TypeError(f"Expected xgb.Booster, got {type(booster)}")
+    
+    if feature_names is None:
+        feature_names = getattr(booster, 'feature_names', None)
+        if not feature_names:
+            num_features = booster.num_feature()
+            feature_names = [f"feature_{i}" for i in range(num_features)]
+    
+    booster.feature_names = feature_names
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        temp_file = f.name
+    
+    try:
+        booster.save_model(temp_file)
+        quickgrove_model = quickgrove.json_load(temp_file)
+        return quickgrove_model
+    finally:
+        if cleanup_temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
+
+
+def xgboost_to_quickgrove_udf(booster: "xgb.Booster", feature_names: list = None, model_name: str = "xgboost_model", cleanup_temp_file: bool = True):
+    quickgrove_model = xgboost_to_quickgrove(
+        booster, 
+        feature_names=feature_names,
+        cleanup_temp_file=cleanup_temp_file
+    )
+    return make_quickgrove_udf(quickgrove_model, model_name=model_name)
+
+
+def extract_onehot_with_ibis(t, model_features: List[str]):
+    base_cols = [col for col in t.columns if col != 'encoded']
+    onehot_features = [f for f in model_features if f not in base_cols]
+    
+    if not onehot_features:
+        return t.select(base_cols)
+    
+    t_with_id = t.mutate(row_id=xo.row_number())
+    
+    unnested = (
+        t_with_id
+        .unnest('encoded')
+        .mutate(
+            key=xo._['encoded']['key'],
+            value=xo._['encoded']['value']
+        )
+        .drop('encoded')
+    )
+    
+    agg_dict = {}
+    
+    for col in base_cols:
+        agg_dict[col] = unnested[col].first()
+    
+    for feature in onehot_features:
+        agg_dict[feature] = (
+            xo.case()
+            .when(unnested.key == feature, unnested.value)
+            .else_(0.0)
+            .end()
+            .sum()
+        )
+    
+    return (
+        unnested
+        .group_by('row_id')
+        .aggregate(**agg_dict)
+        .drop('row_id')
+    )
 
 
 class OneHotStep(OneHotEncoder):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.feature_names_out_ = None
+    
     def transform(self, *args, **kwargs):
         return transform_sklearn_feature_names_out(super(), *args, **kwargs)
+    
+    def fit(self, X, y=None):
+        result = super().fit(X, y)
+        if hasattr(self, 'get_feature_names_out'):
+            self.feature_names_out_ = self.get_feature_names_out()
+        return result
     
     @classmethod
     def get_step_f_kwargs(cls, kwargs):
@@ -49,15 +213,15 @@ class OneHotStep(OneHotEncoder):
 
 
 class MortgageXGBoost(BaseEstimator):
-    def __init__(self, num_boost_round=100, encoded_col=ENCODED):
-        self.encoded_col = encoded_col
+    def __init__(self, num_boost_round=100, encoded_col=ENCODED, **params):
         self.num_boost_round = num_boost_round
+        self.encoded_col = encoded_col
         self.params = {
-            'max_depth': 6,
-            'eta': 0.1, 
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss',
-            'seed': 42
+            'max_depth': params.get('max_depth', 6),
+            'eta': params.get('eta', 0.1), 
+            'objective': params.get('objective', 'binary:logistic'),
+            'eval_metric': params.get('eval_metric', 'logloss'),
+            'seed': params.get('seed', 42)
         }
         self.model = None
     
@@ -81,8 +245,27 @@ class MortgageXGBoost(BaseEstimator):
         return self.model.predict(xgb.DMatrix(X_exploded))
 
 
+@curry
+def load_data(config: DataConfig, ctx: ConnectionContext):
+    perf_expr = xo.deferred_read_parquet(
+        str(config.data_root / config.perf_path), 
+        ctx.duck_con, 
+        "perf_raw"
+    )
+    acq_expr = xo.deferred_read_parquet(
+        str(config.data_root / config.acq_path), 
+        ctx.duck_con, 
+        "acq_raw"
+    )
+    
+    return (
+        acq_expr
+        .join(perf_expr, acq_expr.loan_id == perf_expr.loan_id, how="left")
+        .filter(xo._.monthly_reporting_period <= config.filter_date)
+    )
+
+
 def create_features(expr):
-    """Simplified feature engineering"""
     return expr.mutate([
         xo._.current_loan_delinquency_status.fillna(0).name('delinq_status'),
         xo._.dti.fillna(0).name('dti'),
@@ -98,7 +281,6 @@ def create_features(expr):
 
 
 def create_loan_summary(expr):
-    """Create loan-level summary with key features"""
     return expr.group_by('loan_id').aggregate([
         xo._.orig_interest_rate.first().name('orig_rate'),
         xo._.orig_ltv.first().cast('float64').name('orig_ltv'), 
@@ -119,109 +301,347 @@ def create_loan_summary(expr):
     ])
 
 
-featured_data = create_features(joined_expr)
-
-loan_summary = create_loan_summary(featured_data)
-
-target_col = 'ever_90_delinq'
-
-numeric_features = ['orig_rate', 'orig_ltv', 'dti', 'credit_score', 'orig_upb', 
-                   'current_balance_ratio']
-categorical_features = ['property_state', 'loan_purpose', 'property_type']
-flag_features = ['high_ltv_flag', 'high_dti_flag', 'subprime_flag']
-available_numeric = [f for f in numeric_features if f in loan_summary.columns]
-available_categorical = [f for f in categorical_features if f in loan_summary.columns]
-available_flags = [f for f in flag_features if f in loan_summary.columns]
-
-all_features = available_numeric + available_categorical + available_flags
-
-mutate_exprs = []
-
-for col in available_numeric:
-    if col in ['orig_ltv', 'dti', 'credit_score', 'orig_upb']:
-        mutate_exprs.append(getattr(xo._, col).fill_null(0).name(col))
-    else:
-        mutate_exprs.append(getattr(xo._, col).fill_null(0.0).name(col))
-
-for col in available_categorical:
-    mutate_exprs.append(getattr(xo._, col).fill_null('Unknown').name(col))
-
-for col in available_flags:
-    mutate_exprs.append(getattr(xo._, col).fill_null(False).name(col))
-
-mutate_exprs.append(xo._[target_col].fill_null(0).name(target_col))
-
-ml_data = loan_summary.select(['loan_id'] + all_features + [target_col]).mutate(mutate_exprs)
-
-ml_with_row = ml_data.mutate(row_id=xo.row_number())
-train_expr, test_expr = train_test_splits(
-    ml_with_row, 'row_id', test_sizes=0.5, random_seed=42
-)
-train_clean = train_expr.drop('row_id').cache(storage=ParquetStorage(source=con))
-test_clean = (test_expr.drop('row_id')).cache(storage=ParquetStorage(source=con))
-
-train_clean = (
-        train_clean
-            .mutate(
-                loan_purpose=xo._.loan_purpose.cast(dt.LargeString), 
-                property_type=xo._.property_type.cast(dt.LargeString),
-                property_state=xo._.property_state.cast(dt.LargeString),
-            )
-        )
-
-test_clean = (
-        test_clean 
-            .mutate(
-                loan_purpose=xo._.loan_purpose.cast(dt.LargeString), 
-                property_type=xo._.property_type.cast(dt.LargeString),
-                property_state=xo._.property_state.cast(dt.LargeString),
-            )
-        )
-
-one_hot_step = Step(
-    OneHotStep,
-    "one_hot_encoder", 
-    params_tuple=(("handle_unknown", "ignore"), ("drop", "first"))
-)
-
-xgb_step = Step(
-    MortgageXGBoost,
-    "xgboost_model",
-    params_tuple=(("encoded_col", ENCODED),)
-)
-
-# Fit pipeline
-fitted_onehot = one_hot_step.fit(
-    train_clean,
-    features=available_categorical,
-    dest_col=ENCODED
-)
-
-fitted_xgb = xgb_step.fit(
-    expr=train_clean.mutate(fitted_onehot.mutate),
-    features=available_numeric + available_flags + [ENCODED],
-    target=target_col,
-    dest_col='predicted_prob'
-)
-
-pipeline = FittedPipeline((fitted_onehot, fitted_xgb), train_clean)
-
-# Make predictions
-predictions = pipeline.predict(test_clean).mutate(
-    predicted_class=(xo._.predicted_prob >= 0.5).cast('int')
-)
-
-
-loan_count = loan_summary.count().execute()
-pred_df = predictions.execute()
-y_true = pred_df[target_col]
-y_pred = pred_df['predicted_class']
-y_prob = pred_df['predicted_prob']
-
-auc = roc_auc_score(y_true, y_prob)
-print(f"   AUC Score: {auc:.4f}")
-
-from sklearn.metrics import confusion_matrix
-cm = confusion_matrix(y_true, y_pred)
-print(f"   Confusion Matrix: TN={cm[0,0]}, FP={cm[0,1]}, FN={cm[1,0]}, TP={cm[1,1]}")
+@curry
+def clean_features(config: FeatureConfig, expr):
+    mutate_exprs = []
     
+    for col in config.numeric_features:
+        if col in expr.columns:
+            fill_value = 0 if col in ['orig_ltv', 'dti', 'credit_score', 'orig_upb'] else 0.0
+            mutate_exprs.append(getattr(xo._, col).fill_null(fill_value).name(col))
+    
+    for col in config.categorical_features:
+        if col in expr.columns:
+            mutate_exprs.append(getattr(xo._, col).fill_null('Unknown').name(col))
+    
+    for col in config.flag_features:
+        if col in expr.columns:
+            mutate_exprs.append(getattr(xo._, col).fill_null(False).name(col))
+    
+    mutate_exprs.append(xo._[config.target_col].fill_null(0).name(config.target_col))
+    
+    available_features = [f for f in config.all_features if f in expr.columns]
+    
+    return (
+        expr
+        .select(['loan_id'] + available_features + [config.target_col])
+        .mutate(mutate_exprs)
+    )
+
+
+@curry
+def create_train_test_split(config: PipelineConfig, ctx: ConnectionContext, expr):
+    ml_with_row = expr.mutate(row_id=xo.row_number())
+    train_expr, test_expr = train_test_splits(
+        ml_with_row, 'row_id', 
+        test_sizes=config.test_size, 
+        random_seed=config.random_seed
+    )
+    
+    storage = ParquetStorage(source=ctx.con)
+    train_clean = train_expr.drop('row_id').cache(storage=storage)
+    test_clean = test_expr.drop('row_id').cache(storage=storage)
+    
+    return train_clean, test_clean
+
+
+def create_pipeline_steps(config: PipelineConfig):
+    one_hot_step = Step(
+        OneHotStep,
+        "one_hot_encoder", 
+        params_tuple=(("handle_unknown", "ignore"), ("drop", "first"))
+    )
+
+    xgb_step = Step(
+        MortgageXGBoost,
+        "xgboost_model",
+        params_tuple=(
+            ("num_boost_round", config.model.num_boost_round),
+            ("encoded_col", ENCODED),
+            ("max_depth", config.model.max_depth),
+            ("eta", config.model.eta),
+            ("objective", config.model.objective),
+            ("eval_metric", config.model.eval_metric),
+            ("seed", config.model.seed)
+        )
+    )
+    
+    return one_hot_step, xgb_step
+
+
+def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
+    one_hot_step, xgb_step = create_pipeline_steps(config)
+    
+    fitted_onehot = one_hot_step.fit(
+        train_expr,
+        features=config.features.categorical_features,
+        dest_col=ENCODED,
+        storage=ParquetStorage(),
+    )
+
+    fitted_xgb = xgb_step.fit(
+        expr=train_expr.mutate(fitted_onehot.mutate),
+        features=list(config.features.numeric_features) + 
+                list(config.features.flag_features) + [ENCODED],
+        target=config.features.target_col,
+        dest_col='predicted_prob',
+        storage=ParquetStorage(),
+    )
+
+    pipeline = FittedPipeline((fitted_onehot, fitted_xgb), train_expr)
+
+    
+    predictions = pipeline.predict(test_expr).mutate(
+        predicted_class=(xo._.predicted_prob >= config.model.prediction_threshold).cast('int')
+    )
+    
+    deferred_model = fitted_xgb.deferred_model
+    
+    model = pickle.loads(deferred_model.execute().iloc[0,0]).model
+    
+    return MLPipelineResult(
+        train_expr=train_expr,
+        test_expr=test_expr,
+        fitted_pipeline=pipeline,
+        predictions=predictions,
+        model=model,
+        deferred_model=fitted_xgb.model_udf,
+    )
+
+
+def create_quickgrove_predictions(result: MLPipelineResult, ctx: ConnectionContext):
+    udf = xgboost_to_quickgrove_udf(result.model)
+    
+    fitted_onehot = result.fitted_pipeline.fitted_steps[0]
+    t = fitted_onehot.transform(result.test_expr).into_backend(ctx.duck_con)
+    
+    wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
+    test_predicted = wide_table.into_backend(ctx.con).mutate(
+        prediction=udf.on_expr
+    )
+    
+    return evolve(result, predictions=test_predicted)
+
+
+def predict_new_data(result: MLPipelineResult, new_data_expr, config: PipelineConfig):
+
+    processed_new_data = (
+        pipe(
+            new_data_expr,
+            create_features,
+            create_loan_summary,
+            lambda expr: clean_features(config.features, expr) # spurious into_backend?
+        )
+        .cache(storage=ParquetStorage(source=xo.connect()))
+    )
+    
+    new_predictions = (
+            result
+            .fitted_pipeline
+            .predict(
+                processed_new_data
+            )
+            .mutate(
+                predicted_class=(
+                    xo._.predicted_prob >= config.model.prediction_threshold
+                    )
+                   .cast('int')
+            )
+        )
+    
+    return new_predictions
+
+
+def predict_new_data_with_quickgrove(result: MLPipelineResult, new_data_expr, config: PipelineConfig, ctx: ConnectionContext):
+    processed_new_data = pipe(
+        new_data_expr,
+        create_features,
+        create_loan_summary,
+        lambda expr: clean_features(config.features, expr)
+    )
+    
+    udf = xgboost_to_quickgrove_udf(result.model)
+    
+    fitted_onehot = result.fitted_pipeline.fitted_steps[0]
+    t = (
+        fitted_onehot
+        .transform(
+            processed_new_data
+        )
+        .into_backend(
+            ctx.duck_con
+        )
+    )
+    
+    wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
+    new_predicted = wide_table.into_backend(ctx.con).mutate(
+        prediction=udf.on_expr
+    )
+    
+    return new_predicted
+
+
+def create_xgboost_schema_wide(t, model_features) -> Dict[str, Any]:
+    base_cols = [col for col in t.columns if col != 'encoded']
+    onehot_features = [f for f in model_features if f not in base_cols]
+    
+    schema_dict = {}
+    
+    exclude_cols = {'loan_id', 'ever_90_delinq', 'row_id'}
+    for col in base_cols:
+        if col not in exclude_cols:
+            col_type = t.schema()[col]
+            
+            if str(col_type) == 'boolean':
+                schema_dict[col] = dt.boolean
+            elif 'float' in str(col_type).lower():
+                schema_dict[col] = dt.Float64(nullable=True) if col_type.nullable else dt.float64
+            elif 'int' in str(col_type).lower():
+                schema_dict[col] = dt.Int64(nullable=True) if col_type.nullable else dt.int64
+            else:
+                schema_dict[col] = dt.Float64(nullable=True)
+    
+    for feature in onehot_features:
+        schema_dict[feature] = dt.Float64(nullable=True)
+    
+    return schema_dict
+
+
+def create_xgboost_pandas_udf(
+    model: xgb.Booster, 
+    t,
+    model_features,
+    name: str = "xgboost_scorer"
+):
+    schema_dict = create_xgboost_schema_wide(t, model_features)
+    
+    @xo.udf.make_pandas_udf(
+        schema=xo.schema(schema_dict),
+        return_type=dt.float64,
+        name=name
+    )
+    def score_xgboost(df):
+        df = df.copy()
+        
+        for col in df.columns:
+            if df[col].dtype == bool:
+                df[col] = df[col].astype(float)
+        
+        for feature in model.feature_names:
+            if feature not in df.columns:
+                df[feature] = 0.0
+        
+        feature_df = df[model.feature_names].fillna(0.0)
+        
+        dmatrix = xgb.DMatrix(feature_df)
+        predictions = model.predict(dmatrix)
+        
+        return pd.Series(predictions)
+    
+    return score_xgboost
+
+
+def xgboost_to_pandas_udf(
+    model: xgb.Booster, 
+    t,
+    model_features,
+    name: str = "xgboost_scorer"
+):
+    return create_xgboost_pandas_udf(model, t, model_features, name)
+
+
+def predict_new_data_with_xgboost_udf(
+    result: MLPipelineResult, 
+    new_data_expr, 
+    config: PipelineConfig, 
+    ctx: ConnectionContext
+):
+    processed_new_data = pipe(
+        new_data_expr,
+        create_features,
+        create_loan_summary,
+        lambda expr: clean_features(config.features, expr)
+    )
+    
+    fitted_onehot = result.fitted_pipeline.fitted_steps[0]
+    t = fitted_onehot.transform(processed_new_data).into_backend(ctx.duck_con)
+    
+    udf = xgboost_to_pandas_udf(result.model, t, result.model.feature_names)
+    
+    wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
+    
+    new_predicted = wide_table.into_backend(ctx.con).mutate(
+        prediction=udf.on_expr
+    )
+    
+    return new_predicted
+
+
+
+def create_mortgage_pipeline(config: PipelineConfig):
+    def execute_pipeline():
+        ctx = ConnectionContext.create()
+        
+        load_data_fn = load_data(config.data, ctx)
+        clean_data_fn = clean_features(config.features)
+        split_data_fn = create_train_test_split(config, ctx)
+        
+        return pipe(
+            load_data_fn,
+            create_features,
+            create_loan_summary,
+            clean_data_fn,
+            split_data_fn,
+            lambda split: fit_pipeline(config, split[0], split[1])
+        )
+    
+    return execute_pipeline
+
+
+def main():
+    data_root = pathlib.Path(os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))
+    
+    config = PipelineConfig(
+        data=DataConfig(data_root=data_root),
+        model=evolve(ModelConfig(), num_boost_round=50, max_depth=4)
+    )
+    
+    pipeline = create_mortgage_pipeline(config)
+    result = pipeline()
+    
+    ctx = ConnectionContext.create()
+    final_result = create_quickgrove_predictions(result, ctx)
+    
+    return final_result, config, ctx
+
+
+
+def example_new_data_prediction_with_xgboost_udf():
+    result, config, ctx = main()
+    
+    new_data_expr = (
+        load_data(
+            evolve(
+                config.data, filter_date="2001-01-01"
+            ), 
+            ctx
+        )
+        .cache(
+            storage=ParquetStorage(source=ctx.con)
+        )
+    )
+    
+    new_predictions_quickgrove = predict_new_data_with_quickgrove(result, new_data_expr, config, ctx)
+    
+    new_predictions_xgboost = predict_new_data_with_xgboost_udf(result, new_data_expr, config, ctx)
+    
+    return {
+        'quickgrove': new_predictions_quickgrove,
+        'xgboost_udf': new_predictions_xgboost
+    }
+
+if __name__ == "__main__":
+    result = main()
+    print(f"Pipeline executed successfully!")
+    print(f"Model type: {type(result.model)}")
+    print(f"Predictions shape: {result.predictions.count().execute()}")
