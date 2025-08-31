@@ -371,12 +371,14 @@ def create_pipeline_steps(config: PipelineConfig):
 
 def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
     one_hot_step, xgb_step = create_pipeline_steps(config)
+
+    con = xo.connect()
     
     fitted_onehot = one_hot_step.fit(
         train_expr,
         features=config.features.categorical_features,
         dest_col=ENCODED,
-        storage=ParquetStorage(),
+        storage=ParquetStorage(source=con),
     )
 
     fitted_xgb = xgb_step.fit(
@@ -385,7 +387,7 @@ def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
                 list(config.features.flag_features) + [ENCODED],
         target=config.features.target_col,
         dest_col='predicted_prob',
-        storage=ParquetStorage(),
+        storage=ParquetStorage(source=con),
     )
 
     pipeline = FittedPipeline((fitted_onehot, fitted_xgb), train_expr)
@@ -413,7 +415,7 @@ def create_quickgrove_predictions(result: MLPipelineResult, ctx: ConnectionConte
     udf = xgboost_to_quickgrove_udf(result.model)
     
     fitted_onehot = result.fitted_pipeline.fitted_steps[0]
-    t = fitted_onehot.transform(result.test_expr).into_backend(ctx.duck_con)
+    t = fitted_onehot.transform(result.test_expr).cache(storage=ParquetStorage(source=ctx.duck_con))
     
     wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
     test_predicted = wide_table.into_backend(ctx.con).mutate(
@@ -424,6 +426,7 @@ def create_quickgrove_predictions(result: MLPipelineResult, ctx: ConnectionConte
 
 
 def predict_new_data(result: MLPipelineResult, new_data_expr, config: PipelineConfig):
+    # sklearn prediction
 
     processed_new_data = (
         pipe(
@@ -432,7 +435,7 @@ def predict_new_data(result: MLPipelineResult, new_data_expr, config: PipelineCo
             create_loan_summary,
             lambda expr: clean_features(config.features, expr) # spurious into_backend?
         )
-        .cache(storage=ParquetStorage(source=xo.connect()))
+        .into_backend(con=xo.connect())
     )
     
     new_predictions = (
@@ -468,18 +471,20 @@ def predict_new_data_with_quickgrove(result: MLPipelineResult, new_data_expr, co
         .transform(
             processed_new_data
         )
-        .into_backend(
-            ctx.duck_con
-        )
+        .cache(storage=ParquetStorage(source=ctx.duck_con)) # potential Filter to be pusehd here
     )
-    
+    # FIXME: If i try to cache wide table i get a `Compilation rule for
+    # `TableUnnest` operation is not defined` error 
+
+    # this is needed to avoid the MortgageXGBoost do_explode_encode which we do
+    # not have access to in this udf
     wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
+
     new_predicted = wide_table.into_backend(ctx.con).mutate(
         prediction=udf.on_expr
     )
     
     return new_predicted
-
 
 def create_xgboost_schema_wide(t, model_features) -> Dict[str, Any]:
     base_cols = [col for col in t.columns if col != 'encoded']
@@ -521,8 +526,6 @@ def create_xgboost_pandas_udf(
         name=name
     )
     def score_xgboost(df):
-        df = df.copy()
-        
         for col in df.columns:
             if df[col].dtype == bool:
                 df[col] = df[col].astype(float)
@@ -564,7 +567,8 @@ def predict_new_data_with_xgboost_udf(
     )
     
     fitted_onehot = result.fitted_pipeline.fitted_steps[0]
-    t = fitted_onehot.transform(processed_new_data).into_backend(ctx.duck_con)
+    
+    t = fitted_onehot.transform(processed_new_data).cache(storage=ParquetStorage(source=ctx.duck_con))
     
     udf = xgboost_to_pandas_udf(result.model, t, result.model.feature_names)
     
@@ -615,6 +619,13 @@ def main():
     return final_result, config, ctx
 
 
+def scratch():
+    # transformed cache
+    d = xo.deferred_read_parquet("/home/hussainsultan/.cache/xorq/parquet/letsql_cache-1d75b96f58cd6a54c2f942616087b375.parquet", con=xo.duckdb.connect())
+    wide_table = extract_onehot_with_ibis(d, result.model.feature_names)
+    udf = xgboost_to_quickgrove_udf(result.model)
+    r = wide_table.into_backend(xo.connect()).mutate(prediction=udf.on_expr)
+
 
 def example_new_data_prediction_with_xgboost_udf():
     result, config, ctx = main()
@@ -639,9 +650,3 @@ def example_new_data_prediction_with_xgboost_udf():
         'quickgrove': new_predictions_quickgrove,
         'xgboost_udf': new_predictions_xgboost
     }
-
-if __name__ == "__main__":
-    result = main()
-    print(f"Pipeline executed successfully!")
-    print(f"Model type: {type(result.model)}")
-    print(f"Predictions shape: {result.predictions.count().execute()}")
