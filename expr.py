@@ -30,7 +30,7 @@ class DataConfig:
     data_root: pathlib.Path = field(converter=pathlib.Path)
     perf_path: str = field(default="data/perf/perf.parquet")
     acq_path: str = field(default="data/acq/acq.parquet")
-    filter_date: str = field(default="2001-01-01")
+    filter_date: str = field(default="2001-01-01") # data that works without ArrowInvalid: offset overflow while concatenating arrays
     
     def with_data_root(self, data_root: Union[str, pathlib.Path]) -> 'DataConfig':
         return evolve(self, data_root=pathlib.Path(data_root))
@@ -435,7 +435,10 @@ def predict_new_data(result: MLPipelineResult, new_data_expr, config: PipelineCo
             create_loan_summary,
             lambda expr: clean_features(config.features, expr) # spurious into_backend?
         )
-        .into_backend(con=xo.connect())
+        .into_backend(con=xo.connect()) 
+        # if I remove it I get InvalidInputException: Invalid Input Error:
+        # Python exception occurred while executing the UDF: ValueError: Caller
+        # must bind computed_arg to the output of computed_kwargs_expr
     )
     
     new_predictions = (
@@ -607,7 +610,7 @@ def main():
     
     config = PipelineConfig(
         data=DataConfig(data_root=data_root),
-        model=evolve(ModelConfig(), num_boost_round=50, max_depth=4)
+        model=evolve(ModelConfig(), num_boost_round=50, max_depth=12)
     )
     
     pipeline = create_mortgage_pipeline(config)
