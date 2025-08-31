@@ -378,7 +378,7 @@ requires-dist = [
     { name = "scikit-learn", specifier = ">=1.7.1" },
     { name = "urllib3", specifier = ">=2.2.3" },
     { name = "xgboost", specifier = ">=3.0.4" },
-    { name = "xorq", path = "dist/xorq-0.3.0-py3-none-any.whl" },
+    { name = "xorq", path = "dist/xorq-0.3.1-py3-none-any.whl" },
 ]
 
 [package.metadata.requires-dev]
@@ -1335,8 +1335,8 @@ wheels = [
 
 [[package]]
 name = "xorq"
-version = "0.3.0"
-source = { path = "dist/xorq-0.3.0-py3-none-any.whl" }
+version = "0.3.1"
+source = { path = "dist/xorq-0.3.1-py3-none-any.whl" }
 dependencies = [
     { name = "atpublic" },
     { name = "attrs", marker = "python_full_version < '4'" },
@@ -1368,7 +1368,7 @@ dependencies = [
     { name = "xorq-datafusion" },
 ]
 wheels = [
-    { filename = "xorq-0.3.0-py3-none-any.whl", hash = "sha256:7d28255a4e47fc3c43f39361b30fcb23ed20507e46c9af6122dfd479c689521a" },
+    { filename = "xorq-0.3.1-py3-none-any.whl", hash = "sha256:c34b6b2d0e57766f2be3ea39109d538170aa7ec2c85e5b4275624d9a51fda38d" },
 ]
 
 [package.metadata]

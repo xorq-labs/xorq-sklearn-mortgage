@@ -110,7 +110,7 @@
 
         # Custom package override for xorq
         xorq = prev.xorq.overrideAttrs (old: {
-          src = ./dist/xorq-0.3.0-py3-none-any.whl;
+          src = ./dist/xorq-0.3.1-py3-none-any.whl;
           format = "wheel";
 
           nativeBuildInputs =

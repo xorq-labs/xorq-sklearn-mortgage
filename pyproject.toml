@@ -11,7 +11,7 @@ dependencies = [
     "scikit-learn>=1.7.1",
     "urllib3>=2.2.3",
     "xgboost>=3.0.4",
-    "xorq>=0.3.0",
+    "xorq>=0.3.1",
 ]
 
 [project.scripts]
@@ -26,4 +26,4 @@ dev = [
     "ruff>=0.6.7",
 ]
 [tool.uv.sources]
-xorq = {path = "dist/xorq-0.3.0-py3-none-any.whl"}
+xorq = {path = "dist/xorq-0.3.1-py3-none-any.whl"}
