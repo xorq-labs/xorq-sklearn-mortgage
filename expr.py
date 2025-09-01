@@ -400,12 +400,13 @@ def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
     one_hot_step = OneHotHelper.get_step()
     xgb_step = MortgageXGBoost.get_step(config)
     con = xo.connect()
+    storage = ParquetStorage(source=con)
 
     fitted_onehot = one_hot_step.fit(
         train_expr,
         features=config.features.categorical_features,
         dest_col=ENCODED,
-        storage=ParquetStorage(source=con),
+        storage=storage,
     )
 
     fitted_xgb = xgb_step.fit(
@@ -415,7 +416,7 @@ def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
         + [ENCODED],
         target=config.features.target_col,
         dest_col="predicted_prob",
-        storage=ParquetStorage(source=con),
+        storage=storage,
     )
 
     pipeline = FittedPipeline((fitted_onehot, fitted_xgb), train_expr)
