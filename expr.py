@@ -135,6 +135,92 @@ class PipelineConfig:
     split: SplitConfig = field(factory=SplitConfig)
 
 
+class OneHotHelper(OneHotEncoder):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.feature_names_out_ = None
+
+    def transform(self, *args, **kwargs):
+        return transform_sklearn_feature_names_out(super(), *args, **kwargs)
+
+    def fit(self, X, y=None):
+        result = super().fit(X, y)
+        if hasattr(self, "get_feature_names_out"):
+            self.feature_names_out_ = self.get_feature_names_out()
+        return result
+
+    @classmethod
+    def get_step_f_kwargs(cls, kwargs):
+        from xorq.expr.ml.fit_lib import deferred_fit_transform_sklearn
+
+        return (
+            deferred_fit_transform_sklearn,
+            kwargs
+            | {
+                "return_type": dt.Array(dt.Struct({"key": str, "value": float})),
+                "target": None,
+            },
+        )
+
+    @classmethod
+    def get_step(cls, name="one_hot_step", params_tuple=(("handle_unknown", "ignore"), ("drop", "first"))):
+        return Step(
+            cls,
+            name,
+            params_tuple=params_tuple,
+        )
+
+
+class MortgageXGBoost(BaseEstimator):
+    def __init__(self, num_boost_round=100, encoded_col=ENCODED, **params):
+        self.num_boost_round = num_boost_round
+        self.encoded_col = encoded_col
+        self.params = {
+            "max_depth": params.get("max_depth", 6),
+            "eta": params.get("eta", 0.1),
+            "objective": params.get("objective", "binary:logistic"),
+            "eval_metric": params.get("eval_metric", "logloss"),
+            "seed": params.get("seed", 42),
+        }
+        self.model = None
+
+    return_type = dt.float64
+
+    def explode_encoded(self, X):
+        return X.drop(columns=self.encoded_col).join(
+            X[self.encoded_col].apply(
+                lambda lst: pd.Series({d["key"]: d["value"] for d in lst})
+            )
+        )
+
+    def fit(self, X, y):
+        X_exploded = self.explode_encoded(X)
+        dtrain = xgb.DMatrix(X_exploded, y)
+        self.model = xgb.train(self.params, dtrain, self.num_boost_round)
+        return self
+
+    def predict(self, X):
+        X_exploded = self.explode_encoded(X)
+        return self.model.predict(xgb.DMatrix(X_exploded))
+
+    @classmethod
+    def get_step(cls, config, name="xgboost_model"):
+        params_tuple=(
+            ("num_boost_round", config.model.num_boost_round),
+            ("encoded_col", ENCODED),
+            ("max_depth", config.model.max_depth),
+            ("eta", config.model.eta),
+            ("objective", config.model.objective),
+            ("eval_metric", config.model.eval_metric),
+            ("seed", config.model.seed),
+        )
+        return Step(
+            cls,
+            name,
+            params_tuple=params_tuple,
+        )
+
+
 @frozen
 class MLPipelineResult:
     train_expr: Any = field()
@@ -224,75 +310,6 @@ def extract_onehot_with_ibis(t, model_features: List[str]):
     return unnested.group_by("row_id").aggregate(**agg_dict).drop("row_id")
 
 
-class OneHotHelper(OneHotEncoder):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.feature_names_out_ = None
-
-    def transform(self, *args, **kwargs):
-        return transform_sklearn_feature_names_out(super(), *args, **kwargs)
-
-    def fit(self, X, y=None):
-        result = super().fit(X, y)
-        if hasattr(self, "get_feature_names_out"):
-            self.feature_names_out_ = self.get_feature_names_out()
-        return result
-
-    @classmethod
-    def get_step_f_kwargs(cls, kwargs):
-        from xorq.expr.ml.fit_lib import deferred_fit_transform_sklearn
-
-        return (
-            deferred_fit_transform_sklearn,
-            kwargs
-            | {
-                "return_type": dt.Array(dt.Struct({"key": str, "value": float})),
-                "target": None,
-            },
-        )
-
-    @classmethod
-    def get_step(cls, name="one_hot_step", params_tuple=(("handle_unknown", "ignore"), ("drop", "first"))):
-        return Step(
-            cls,
-            name,
-            params_tuple=params_tuple,
-        )
-
-
-class MortgageXGBoost(BaseEstimator):
-    def __init__(self, num_boost_round=100, encoded_col=ENCODED, **params):
-        self.num_boost_round = num_boost_round
-        self.encoded_col = encoded_col
-        self.params = {
-            "max_depth": params.get("max_depth", 6),
-            "eta": params.get("eta", 0.1),
-            "objective": params.get("objective", "binary:logistic"),
-            "eval_metric": params.get("eval_metric", "logloss"),
-            "seed": params.get("seed", 42),
-        }
-        self.model = None
-
-    return_type = dt.float64
-
-    def explode_encoded(self, X):
-        return X.drop(columns=self.encoded_col).join(
-            X[self.encoded_col].apply(
-                lambda lst: pd.Series({d["key"]: d["value"] for d in lst})
-            )
-        )
-
-    def fit(self, X, y):
-        X_exploded = self.explode_encoded(X)
-        dtrain = xgb.DMatrix(X_exploded, y)
-        self.model = xgb.train(self.params, dtrain, self.num_boost_round)
-        return self
-
-    def predict(self, X):
-        X_exploded = self.explode_encoded(X)
-        return self.model.predict(xgb.DMatrix(X_exploded))
-
-
 def create_features(expr):
     return expr.mutate(
         [
@@ -375,27 +392,13 @@ def create_train_test_split(config: PipelineConfig, ctx: ConnectionContext, expr
 
 def create_pipeline_steps(config: PipelineConfig):
     one_hot_step = OneHotHelper.get_step()
-
-    xgb_step = Step(
-        MortgageXGBoost,
-        "xgboost_model",
-        params_tuple=(
-            ("num_boost_round", config.model.num_boost_round),
-            ("encoded_col", ENCODED),
-            ("max_depth", config.model.max_depth),
-            ("eta", config.model.eta),
-            ("objective", config.model.objective),
-            ("eval_metric", config.model.eval_metric),
-            ("seed", config.model.seed),
-        ),
-    )
-
+    xgb_step = MortgageXGBoost.get_step()
     return one_hot_step, xgb_step
 
 
 def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
-    one_hot_step, xgb_step = create_pipeline_steps(config)
-
+    one_hot_step = OneHotHelper.get_step()
+    xgb_step = MortgageXGBoost.get_step(config)
     con = xo.connect()
 
     fitted_onehot = one_hot_step.fit(
