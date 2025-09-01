@@ -425,17 +425,12 @@ def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
             "int"
         )
     )
-
-    deferred_model = fitted_xgb.deferred_model
-
-    model = pickle.loads(deferred_model.execute().iloc[0, 0]).model
-
     return MLPipelineResult(
         train_expr=train_expr,
         test_expr=test_expr,
         fitted_pipeline=pipeline,
         predictions=predictions,
-        model=model,
+        model=fitted_xgb.model,
         deferred_model=fitted_xgb.model_udf,
     )
 
