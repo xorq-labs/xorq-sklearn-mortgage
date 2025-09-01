@@ -26,16 +26,46 @@ from xorq.ml import make_quickgrove_udf, rewrite_quickgrove_expr
 
 
 @frozen
+class ConnectionContext:
+    con: Any = field()
+    duck_con: Any = field()
+
+    @classmethod
+    def create(cls) -> "ConnectionContext":
+        return cls(con=xo.connect(), duck_con=xo.duckdb.connect())
+
+
+@frozen
 class DataConfig:
     data_root: pathlib.Path = field(converter=pathlib.Path)
-    perf_path: str = field(default="data/perf/perf.parquet")
-    acq_path: str = field(default="data/acq/acq.parquet")
+    perf_rel_path: str = field(default="data/perf/perf.parquet")
+    acq_rel_path: str = field(default="data/acq/acq.parquet")
     filter_date: str = field(
         default="2001-01-01"
     )  # data that works without ArrowInvalid: offset overflow while concatenating arrays
 
-    def with_data_root(self, data_root: Union[str, pathlib.Path]) -> "DataConfig":
-        return evolve(self, data_root=pathlib.Path(data_root))
+    @property
+    def perf_path(self):
+        return self.data_root.joinpath(self.perf_rel_path)
+
+    @property
+    def acq_path(self):
+        return self.data_root.joinpath(self.acq_rel_path)
+
+    def load_data(self, ctx: ConnectionContext):
+        perf_expr = xo.deferred_read_parquet(
+            self.perf_path, ctx.duck_con, "perf_raw"
+        )
+        acq_expr = xo.deferred_read_parquet(
+            self.acq_path, ctx.duck_con, "acq_raw"
+        )
+        expr = acq_expr.join(
+            perf_expr, acq_expr.loan_id == perf_expr.loan_id, how="left"
+        ).filter(xo._.monthly_reporting_period <= self.filter_date)
+        return expr
+
+
+load_data = DataConfig.load_data
 
 
 @frozen
@@ -85,22 +115,24 @@ class ModelConfig:
 
 
 @frozen
+class SplitConfig:
+    test_size: float = field(default=0.5)
+    random_seed: int = field(default=42)
+
+    @property
+    def split_kwargs(self):
+        return {
+            "random_seed": self.random_seed,
+            "test_sizes": self.test_size,
+        }
+
+
+@frozen
 class PipelineConfig:
     data: DataConfig = field(factory=DataConfig)
     features: FeatureConfig = field(factory=FeatureConfig)
     model: ModelConfig = field(factory=ModelConfig)
-    test_size: float = field(default=0.5)
-    random_seed: int = field(default=42)
-
-
-@frozen
-class ConnectionContext:
-    con: Any = field()
-    duck_con: Any = field()
-
-    @classmethod
-    def create(cls) -> "ConnectionContext":
-        return cls(con=xo.connect(), duck_con=xo.duckdb.connect())
+    split: SplitConfig = field(factory=SplitConfig)
 
 
 @frozen
@@ -192,7 +224,7 @@ def extract_onehot_with_ibis(t, model_features: List[str]):
     return unnested.group_by("row_id").aggregate(**agg_dict).drop("row_id")
 
 
-class OneHotStep(OneHotEncoder):
+class OneHotHelper(OneHotEncoder):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.feature_names_out_ = None
@@ -217,6 +249,14 @@ class OneHotStep(OneHotEncoder):
                 "return_type": dt.Array(dt.Struct({"key": str, "value": float})),
                 "target": None,
             },
+        )
+
+    @classmethod
+    def get_step(cls, name="one_hot_step", params_tuple=(("handle_unknown", "ignore"), ("drop", "first"))):
+        return Step(
+            cls,
+            name,
+            params_tuple=params_tuple,
         )
 
 
@@ -251,20 +291,6 @@ class MortgageXGBoost(BaseEstimator):
     def predict(self, X):
         X_exploded = self.explode_encoded(X)
         return self.model.predict(xgb.DMatrix(X_exploded))
-
-
-@curry
-def load_data(config: DataConfig, ctx: ConnectionContext):
-    perf_expr = xo.deferred_read_parquet(
-        str(config.data_root / config.perf_path), ctx.duck_con, "perf_raw"
-    )
-    acq_expr = xo.deferred_read_parquet(
-        str(config.data_root / config.acq_path), ctx.duck_con, "acq_raw"
-    )
-
-    return acq_expr.join(
-        perf_expr, acq_expr.loan_id == perf_expr.loan_id, how="left"
-    ).filter(xo._.monthly_reporting_period <= config.filter_date)
 
 
 def create_features(expr):
@@ -337,8 +363,7 @@ def create_train_test_split(config: PipelineConfig, ctx: ConnectionContext, expr
     train_expr, test_expr = train_test_splits(
         ml_with_row,
         "row_id",
-        test_sizes=config.test_size,
-        random_seed=config.random_seed,
+        **config.split.split_kwargs,
     )
 
     storage = ParquetStorage(source=ctx.con)
@@ -349,11 +374,7 @@ def create_train_test_split(config: PipelineConfig, ctx: ConnectionContext, expr
 
 
 def create_pipeline_steps(config: PipelineConfig):
-    one_hot_step = Step(
-        OneHotStep,
-        "one_hot_encoder",
-        params_tuple=(("handle_unknown", "ignore"), ("drop", "first")),
-    )
+    one_hot_step = OneHotHelper.get_step()
 
     xgb_step = Step(
         MortgageXGBoost,
@@ -646,7 +667,9 @@ def example_new_data_prediction_with_xgboost_udf():
         result, new_data_expr, config, ctx
     )
 
-    return {
+    dct = {
         "quickgrove": new_predictions_quickgrove,
         "xgboost_udf": new_predictions_xgboost,
     }
+    # df = pd.DataFrame({k: v.execute().set_index("loan_id")["prediction"] for k, v in dct.items()})
+    return dct
