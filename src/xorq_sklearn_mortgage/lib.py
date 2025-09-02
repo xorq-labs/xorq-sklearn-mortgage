@@ -7,6 +7,9 @@ from sklearn.base import BaseEstimator
 from sklearn.preprocessing import OneHotEncoder
 from attrs import frozen, field
 
+import threading
+from codetiming import Timer
+
 import xorq.api as xo
 import xorq.expr.datatypes as dt
 from xorq.expr.ml.fit_lib import transform_sklearn_feature_names_out
@@ -176,11 +179,48 @@ class MortgageXGBoost(BaseEstimator):
     return_type = dt.float64
 
     def explode_encoded(self, X):
-        return X.drop(columns=self.encoded_col).join(
-            X[self.encoded_col].apply(
-                lambda lst: pd.Series({d["key"]: d["value"] for d in lst})
+        def make_df_apply(series):
+            df = (
+                series
+                .apply(
+                    lambda lst: pd.Series({d["key"]: d["value"] for d in lst})
+                )
             )
-        )
+            return df
+
+        def make_df_expensive(series):
+            (keys, values) = (
+                [
+                    [dct[which] for dct in lst]
+                    for lst in series
+                ]
+                for which in ("key", "value")
+            )
+            ((columns, _), *rest) = pd.DataFrame(keys).value_counts().items()
+            assert not rest
+            df = pd.DataFrame(
+                values,
+                index=X.index,
+                columns=columns,
+            )
+            return df
+
+        def make_df_cheap(series):
+            values = [
+                [dct["value"] for dct in lst]
+                for lst in series
+            ]
+            columns = [dct["key"] for dct in series.iloc[0]]
+            df = pd.DataFrame(
+                values,
+                index=series.index,
+                columns=columns,
+            )
+            return df
+
+        f = make_df_cheap
+        with Timer(f"exlode_encoded-{f.__name__}-{threading.current_thread().native_id}", logger=None):
+            return X.drop(columns=self.encoded_col).join(f(X[self.encoded_col]))
 
     def fit(self, X, y):
         X_exploded = self.explode_encoded(X)
