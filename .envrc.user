@@ -1,1 +1,2 @@
 use flake .#uv2nix
+source_env_if_exists .env.otel
