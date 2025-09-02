@@ -192,13 +192,13 @@ class MortgageXGBoost(BaseEstimator):
         def make_df_expensive(series):
             (keys, values) = (
                 [
-                    [dct[which] for dct in lst]
+                    tuple(dct[which] for dct in lst)
                     for lst in series
                 ]
                 for which in ("key", "value")
             )
-            ((columns, _), *rest) = pd.DataFrame(keys).value_counts().items()
-            assert not rest
+            (columns, *rest) = keys
+            assert all(el == columns for el in rest)
             df = pd.DataFrame(
                 values,
                 index=X.index,
@@ -219,7 +219,7 @@ class MortgageXGBoost(BaseEstimator):
             )
             return df
 
-        f = make_df_cheap
+        f = make_df_expensive
         with Timer(f"exlode_encoded-{f.__name__}-{threading.current_thread().native_id}", logger=None):
             return X.drop(columns=self.encoded_col).join(f(X[self.encoded_col]))
 
