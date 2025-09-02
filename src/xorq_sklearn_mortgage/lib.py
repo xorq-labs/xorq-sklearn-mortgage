@@ -1,3 +1,4 @@
+import os
 import pathlib
 from typing import Tuple, Dict, Any
 
@@ -29,7 +30,7 @@ class ConnectionContext:
 
 @frozen
 class DataConfig:
-    data_root: pathlib.Path = field(converter=pathlib.Path)
+    data_root: pathlib.Path = field(converter=pathlib.Path, default=os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))
     perf_rel_path: str = field(default="data/perf/perf.parquet")
     acq_rel_path: str = field(default="data/acq/acq.parquet")
     filter_date: str = field(
@@ -224,13 +225,15 @@ class MortgageXGBoost(BaseEstimator):
 
     def fit(self, X, y):
         X_exploded = self.explode_encoded(X)
-        dtrain = xgb.DMatrix(X_exploded, y)
-        self.model = xgb.train(self.params, dtrain, self.num_boost_round)
-        return self
+        with Timer(f"MortgageXGBoost.fit-{threading.current_thread().native_id}", logger=None):
+            dtrain = xgb.DMatrix(X_exploded, y)
+            self.model = xgb.train(self.params, dtrain, self.num_boost_round)
+            return self
 
     def predict(self, X):
         X_exploded = self.explode_encoded(X)
-        return self.model.predict(xgb.DMatrix(X_exploded))
+        with Timer(f"MortgageXGBoost.predict-{threading.current_thread().native_id}", logger=None):
+            return self.model.predict(xgb.DMatrix(X_exploded))
 
     @classmethod
     def get_step(cls, config, name="xgboost_model"):
