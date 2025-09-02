@@ -1,12 +1,31 @@
 import pathlib
 import os
 import tempfile
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
+from pathlib import Path
+from xorq.vendor.ibis.common.annotations import Argument
+from xorq.vendor.ibis.expr.operations.udf import InputType, ScalarUDF
+from xorq.vendor.ibis.expr.rules import ValueOf
+from xorq.vendor.ibis.util import Namespace
+from xorq.vendor.ibis.common.collections import FrozenDict
+from xorq.vendor.ibis.common.patterns import pattern, replace
 
 import pandas as pd
 import xgboost as xgb
 from toolz import curry, pipe
 from attrs import frozen, evolve, field
+
+import warnings
+from typing import List, Dict, Any, Callable
+from xorq.vendor.ibis.expr import operations as ops
+import xorq.vendor.ibis.expr.types as ir
+from xorq.vendor.ibis.common.patterns import pattern, replace
+from xorq.vendor.ibis.common.annotations import Argument
+from xorq.vendor.ibis.expr.rules import ValueOf
+from xorq.expr.ml.structer import ENCODED
+from xorq.expr.ml.quickgrove_lib import UDFWrapper
+import xorq.expr.datatypes as dt
+import pandas as pd
 
 import xorq.api as xo
 import xorq.expr.datatypes as dt
@@ -24,7 +43,14 @@ from xorq_sklearn_mortgage.lib import (
     MortgageXGBoost,
     load_data,
 )
+from xorq.api import make_quickgrove_udf, rewrite_quickgrove_expr
+from xorq.expr.ml.quickgrove_lib import UDFWrapper, _create_udf_function, _create_udf_node, collect_predicates, _all_predicates_are_features, _validate_model_features
 
+SUPPORTED_TYPES = {
+     "float": dt.float64,
+     "i": dt.boolean,
+     "int": dt.int64,
+ }
 
 @frozen
 class MLPipelineResult:
@@ -36,17 +62,193 @@ class MLPipelineResult:
     deferred_model: Any = field(default=None)
 
 
+p = Namespace(pattern, module=ops)
+def _validate_model_features(
+    model: "PyGradientBoostedDecisionTrees", supported_types: dict
+) -> None:
+    """Raise an error if the model has unsupported feature types."""
+    schema = [model.feature_names[i] for i in sorted(model.required_features)]
+    feature_types = [model.feature_types[i] for i in sorted(model.required_features)]
+    unsupported = [
+        f"{name}: {type_}"
+        for name, type_ in zip(schema, feature_types)
+        if type_ not in supported_types
+    ]
+    if unsupported:
+        raise ValueError(f"Unsupported feature types: {', '.join(unsupported)}")
+
+
+def make_pruned_udf(
+    original_udf,
+    predicates: List[dict],
+) -> UDFWrapper:
+    """
+    Create a new pruned UDF from an existing UDF and a list of predicates.
+    `original_udf` must have a `.model` attribute.
+    """
+    from quickgrove import Feature
+    
+    model = original_udf.model
+    pred_feature_names = {pred["column"] for pred in predicates}
+    model_feature_names = set(model.feature_names)
+    
+    if not pred_feature_names.issubset(model_feature_names):
+        warnings.warn(
+            "Feature not found in predicates, skipping pruning...", UserWarning
+        )
+        return original_udf
+    
+    pruned_model = model.prune(
+        [
+            Feature(pred["column"]) < pred["value"]
+            if pred["op"] == "Less"
+            else Feature(pred["column"]) >= pred["value"]
+            if pred["op"] == "Greater"
+            else Feature(pred["column"]) >= pred["value"]
+            for pred in predicates
+        ]
+    )
+    
+    _validate_model_features(pruned_model, SUPPORTED_TYPES)
+    required_features = sorted(pruned_model.required_features)
+    schema = [pruned_model.feature_names[i] for i in required_features]
+    
+    # Handle ENCODED column structure
+    fields = {}
+    
+    # Get required features from the UDF function's metadata
+    # This should be set when the UDF is created
+    if hasattr(original_udf, '_required_features'):
+        required_features_list = original_udf._required_features
+    else:
+        # Fallback: assume all base features + ENCODED
+        # This is a temporary fallback until we modify UDF creation
+        base_features = [name for name in model.feature_names 
+                        if name != ENCODED and not any(name.startswith(prefix + '_') 
+                        for prefix in ['property_state', 'loan_purpose', 'property_type'])]
+        required_features_list = base_features + [ENCODED]
+    
+    for name in required_features_list:
+        if name != ENCODED:
+            fields[name] = Argument(
+                pattern=ValueOf(dt.float64),
+                typehint=dt.float64,
+            )
+    
+    # Always include ENCODED column
+    fields[ENCODED] = Argument(
+        pattern=ValueOf(dt.Array(dt.Struct({"key": dt.string, "value": dt.float64}))),
+        typehint=dt.Array(dt.Struct({"key": dt.string, "value": dt.float64})),
+    )
+    
+    def fn_from_arrays(*arrays):
+        if len(arrays) != len(fields):
+            raise ValueError(f"Expected {len(fields)} arrays, got {len(arrays)}")
+        
+        # Last array is always ENCODED
+        encoded_array = arrays[-1]
+        base_arrays = arrays[:-1]
+        
+        # Create base DataFrame
+        base_feature_names = [name for name in fields.keys() if name != ENCODED]
+        base_df = pd.DataFrame({
+            feature: array for feature, array in zip(base_feature_names, base_arrays)
+        })
+        
+        # Process encoded features
+        encoded_series = pd.Series(encoded_array)
+        onehot_df = make_df_cheap(encoded_series)
+        
+        # Combine base and encoded features
+        combined_df = pd.concat([base_df, onehot_df], axis=1)
+        
+        # Prepare feature matrix for pruned model
+        feature_matrix = pd.DataFrame()
+        for feature in schema:
+            if feature in combined_df.columns:
+                feature_matrix[feature] = combined_df[feature].fillna(0.0)
+            else:
+                feature_matrix[feature] = 0.0
+        
+        # Use pruned model for prediction
+        feature_arrays = [feature_matrix[feature].values for feature in schema]
+        return pruned_model.predict_arrays(feature_arrays)
+    
+    udf_func = _create_udf_function(
+        _create_udf_node(
+            model=pruned_model,
+            fn_from_arrays=fn_from_arrays,
+            fields=fields,
+            udf_name=getattr(original_udf.name, '__name__', 'udf') + "_pruned",
+        )
+    )
+    
+    return UDFWrapper(
+        udf_func,
+        pruned_model,
+        getattr(original_udf, 'model_path', 'temp'),
+        required_features=list(fields.keys()),
+    )
+
+
+@replace(p.Filter(p.Project))
+def prune_quickgrove_model(_, **kwargs):
+    """Rewrite rule to prune quickgrove model based on filter predicates."""
+    parent_op = _.parent
+    predicates = collect_predicates(_)
+    if not predicates:
+        return _
+
+    new_values = {}
+    pruned_udf_wrapper = None
+
+    for name, value in parent_op.values.items():
+        if isinstance(value, ops.ScalarUDF) and hasattr(value, "model"):
+            # return filter op if predicates are not in filter
+            if not _all_predicates_are_features(_, value.model):
+                return _
+
+            pruned_udf_wrapper = make_pruned_udf(value, predicates)
+            required_features = pruned_udf_wrapper.required_features
+            
+            udf_kwargs = {
+                feat_name: parent_op.values[feat_name]
+                for feat_name in required_features
+                if feat_name in parent_op.values
+            }
+            
+            # Apply the pruned UDF
+            if callable(pruned_udf_wrapper):
+                new_values[name] = pruned_udf_wrapper(**udf_kwargs)
+            else:
+                new_values[name] = value
+        else:
+            new_values[name] = value
+
+    if not pruned_udf_wrapper:
+        return _
+
+    new_project = ops.Project(parent_op.parent, new_values)
+
+    subs = {
+        ops.Field(parent_op, k): ops.Field(new_project, k) for k in parent_op.values
+    }
+    new_predicates = tuple(p.replace(subs, filter=ops.Value) for p in _.predicates)
+    return ops.Filter(parent=new_project, predicates=new_predicates)
+
+
+def rewrite_quickgrove_expr(expr) -> ir.Table:
+    """Rewrite an Ibis expression by pruning quickgrove models based on filter conditions."""
+    op = expr.op()
+    new_op = op.replace(prune_quickgrove_model)
+    return new_op.to_expr()
+
+
 def xgboost_to_quickgrove(
     booster: "xgb.Booster", feature_names: list = None, cleanup_temp_file: bool = True
 ):
-    try:
-        import xgboost as xgb
-        import quickgrove
-    except ImportError as e:
-        missing_lib = "xgboost" if "xgboost" in str(e) else "quickgrove"
-        raise ImportError(
-            f"Required library '{missing_lib}' is not installed. Please install it with: pip install {missing_lib}"
-        ) from e
+    import xgboost as xgb
+    import quickgrove
 
     if not isinstance(booster, xgb.Booster):
         raise TypeError(f"Expected xgb.Booster, got {type(booster)}")
@@ -81,6 +283,121 @@ def xgboost_to_quickgrove_udf(
         booster, feature_names=feature_names, cleanup_temp_file=cleanup_temp_file
     )
     return make_quickgrove_udf(quickgrove_model, model_name=model_name)
+
+
+def mortgage_xgboost_to_quickgrove(booster: "MortgageXGBoost", cleanup_temp_file: bool = True):
+
+    import xgboost as xgb
+    import quickgrove
+
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        temp_file = f.name
+
+    try:
+        booster.model.save_model(temp_file)
+        quickgrove_model = quickgrove.json_load(temp_file)
+        return quickgrove_model
+    finally:
+        if cleanup_temp_file and os.path.exists(temp_file):
+            os.unlink(temp_file)
+
+
+def mortgage_xgboost_to_quickgrove_udf(
+    booster: "MortgageXGBoost",
+    model_name: str = "xgboost_model",
+    cleanup_temp_file: bool = True,
+):
+    quickgrove_model = mortgage_xgboost_to_quickgrove(
+        booster, cleanup_temp_file=cleanup_temp_file
+    )
+
+    return make_quickgrove_udf(quickgrove_model,feature_names=booster.feature_names)
+
+
+def make_df_cheap(series):
+    values = [
+        [dct["value"] for dct in lst]
+        for lst in series
+    ]
+    columns = [dct["key"] for dct in series.iloc[0]]
+    df = pd.DataFrame(
+        values,
+        index=series.index,
+        columns=columns,
+    )
+    return df
+
+
+def make_quickgrove_udf(
+    model_or_path: Union[str, Path, "PyGradientBoostedDecisionTrees"], 
+    feature_names: List[str],
+    model_name="quickgrove_model_xgb"
+) -> UDFWrapper:
+    from xorq.expr.ml.quickgrove_lib import (
+        _load_quickgrove_model, _extract_model_name, _validate_model_features,
+        _create_udf_node, _create_udf_function, SUPPORTED_TYPES, UDFWrapper
+    )
+
+    model, model_path = _load_quickgrove_model(model_or_path)
+    model_path ="temp"
+
+
+    _validate_model_features(model, SUPPORTED_TYPES)
+    
+    fields = {}
+    for feature in feature_names:
+        fields[feature] = Argument(
+            pattern=ValueOf(dt.float64),
+            typehint=dt.float64,
+        )
+    
+    fields[ENCODED] = Argument(
+        pattern=ValueOf(dt.Array(dt.Struct({"key": dt.string, "value": dt.float64}))),
+        typehint=dt.Array(dt.Struct({"key": dt.string, "value": dt.float64})),
+    )
+
+    def fn_from_arrays(*arrays):
+        if len(arrays) != len(feature_names):
+            raise ValueError(f"Expected {len(feature_names)} arrays, got {len(arrays)}")
+        
+        encoded_array = arrays[-1]
+        
+        base_df = pd.DataFrame({
+            feature: array for feature, array in zip(feature_names, arrays)
+        }).drop(columns=ENCODED)
+        
+        encoded_series = pd.Series(encoded_array)
+        onehot_df = make_df_cheap(encoded_series)
+        
+        combined_df = pd.concat([base_df, onehot_df], axis=1)
+        
+        feature_matrix = pd.DataFrame()
+        all_features = list(combined_df.columns)
+        for feature in list(all_features):
+            feature_matrix[feature] = combined_df[feature].fillna(0.0)
+        
+        feature_arrays = [feature_matrix[feature].values for feature in all_features]
+        return model.predict_arrays(feature_arrays)
+
+    required_features = list(feature_names)
+
+    udf_func = _create_udf_function(
+        _create_udf_node(
+            model=model,
+            fn_from_arrays=fn_from_arrays,
+            fields=fields,
+            udf_name=model_name,
+            extra_meta={"model_path": model_path},
+        )
+    )
+
+    return UDFWrapper(
+        func=udf_func,
+        model=model,
+        model_path=model_path,
+        required_features=required_features,
+    )
 
 
 def extract_onehot_with_ibis(t, model_features: List[str]):
@@ -144,9 +461,9 @@ def create_loan_summary(expr):
             xo._.delinq_status.max().cast("float64").name("max_delinquency"),
             xo._.target_delinquent.max().cast("float64").name("ever_90_delinq"),
             xo._.balance_ratio.last().name("current_balance_ratio"),
-            xo._.high_ltv.any().name("high_ltv_flag"),
-            xo._.high_dti.any().name("high_dti_flag"),
-            xo._.subprime.any().name("subprime_flag"),
+            xo._.high_ltv.any().cast("float64").name("high_ltv_flag"),
+            xo._.high_dti.any().cast("float64").name("high_dti_flag"),
+            xo._.subprime.any().cast("float64").name("subprime_flag"),
         ]
     )
 
@@ -168,7 +485,7 @@ def clean_features(config: FeatureConfig, expr):
 
     for col in config.flag_features:
         if col in expr.columns:
-            mutate_exprs.append(getattr(xo._, col).fill_null(False).name(col))
+            mutate_exprs.append(getattr(xo._, col).fill_null(0).name(col))
 
     mutate_exprs.append(xo._[config.target_col].fill_null(0).name(config.target_col))
 
@@ -242,15 +559,15 @@ def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
 
 
 def create_quickgrove_predictions(result: MLPipelineResult, ctx: ConnectionContext):
-    udf = xgboost_to_quickgrove_udf(result.model)
+    udf = mortgage_xgboost_to_quickgrove_udf(result.model)
 
     fitted_onehot = result.fitted_pipeline.fitted_steps[0]
+
     t = fitted_onehot.transform(result.test_expr).cache(
-        storage=ParquetStorage(source=ctx.duck_con)
+        storage=ParquetStorage(source=ctx.con)
     )
 
-    wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
-    test_predicted = wide_table.into_backend(ctx.con).mutate(prediction=udf.on_expr)
+    test_predicted = t.mutate(prediction=udf.on_expr)
 
     return evolve(result, predictions=test_predicted)
 
@@ -295,13 +612,13 @@ def predict_new_data_with_quickgrove(
         lambda expr: clean_features(config.features, expr),
     )
 
-    udf = xgboost_to_quickgrove_udf(result.model)
+    udf = mortgage_xgboost_to_quickgrove_udf(result.model)
 
     fitted_onehot = result.fitted_pipeline.fitted_steps[0]
     t = (
         fitted_onehot.transform(processed_new_data).cache(
-            storage=ParquetStorage(source=ctx.duck_con)
-        )  # potential Filter to be pushed here
+            storage=ParquetStorage(source=ctx.con)
+        )# potential Filter to be pushed here
     )
     # actively require the user to request the rewrite
 
@@ -310,9 +627,9 @@ def predict_new_data_with_quickgrove(
 
     # this is needed to avoid the MortgageXGBoost do_explode_encode which we do
     # not have access to in this udf
-    wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
+    #wide_table = extract_onehot_with_ibis(t, result.model.model.feature_names)
 
-    new_predicted = wide_table.into_backend(ctx.con).mutate(prediction=udf.on_expr)
+    new_predicted = t.mutate(prediction=udf.on_expr)
 
     return new_predicted
 
@@ -396,12 +713,13 @@ def predict_new_data_with_xgboost_udf(
     fitted_onehot = result.fitted_pipeline.fitted_steps[0]
 
     t = fitted_onehot.transform(processed_new_data).cache(
-        storage=ParquetStorage(source=ctx.duck_con)
-    )
+        storage=ParquetStorage(source=ctx.con)
+    ) 
+    #.filter(xo._.orig_rate>6)
 
-    udf = xgboost_to_pandas_udf(result.model, t, result.model.feature_names)
+    udf = xgboost_to_pandas_udf(result.model.model, t, result.model.model.feature_names)
 
-    wide_table = extract_onehot_with_ibis(t, result.model.feature_names)
+    wide_table = extract_onehot_with_ibis(t, result.model.model.feature_names)
 
     new_predicted = wide_table.into_backend(ctx.con).mutate(prediction=udf.on_expr)
 
@@ -440,9 +758,9 @@ def main():
     result = pipeline()
 
     ctx = ConnectionContext.create()
-    final_result = create_quickgrove_predictions(result, ctx)
+    #final_result = create_quickgrove_predictions(result, ctx)
 
-    return final_result, config, ctx
+    return result, config, ctx
 
 
 def scratch():

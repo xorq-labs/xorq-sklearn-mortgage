@@ -176,6 +176,7 @@ class MortgageXGBoost(BaseEstimator):
             "seed": params.get("seed", 42),
         }
         self.model = None
+        self.feature_names = []
 
     return_type = dt.float64
 
@@ -224,6 +225,7 @@ class MortgageXGBoost(BaseEstimator):
             return X.drop(columns=self.encoded_col).join(f(X[self.encoded_col]))
 
     def fit(self, X, y):
+        self.feature_names = X.columns
         X_exploded = self.explode_encoded(X)
         with Timer(f"MortgageXGBoost.fit-{threading.current_thread().native_id}", logger=None):
             dtrain = xgb.DMatrix(X_exploded, y)

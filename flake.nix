@@ -121,6 +121,18 @@
             };
           buildInputs = (old.buildInputs or []) ++ [pkgs.openssl];
         });
+        # Custom package override for quickgrove
+        quickgrove = prev.xorq.overrideAttrs (old: {
+          src = ./dist/quickgrove-0.1.4-cp312-cp312-linux_x86_64.whl;
+          format = "wheel";
+          nativeBuildInputs =
+            (old.nativeBuildInputs or [])
+            ++ final.resolveBuildSystem {
+              setuptools = [];
+              wheel = [];
+            };
+          buildInputs = (old.buildInputs or []) ++ [pkgs.openssl];
+        });
 
         # Network/RPC packages
         grpcio = prev.grpcio.overrideAttrs (old: {

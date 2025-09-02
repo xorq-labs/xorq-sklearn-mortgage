@@ -28,3 +28,4 @@ dev = [
 ]
 [tool.uv.sources]
 xorq = {path = "dist/xorq-0.3.1-py3-none-any.whl"}
+quickgrove={path="dist/quickgrove-0.1.4-cp312-cp312-linux_x86_64.whl"}
