@@ -1,5 +1,5 @@
 [project]
-name = "hello-world"
+name = "xorq-sklearn-mortgage"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-hello = "hello_world:hello"
+hello = "xorq_sklearn_mortgage:hello"
 
 [build-system]
 requires = ["hatchling"]

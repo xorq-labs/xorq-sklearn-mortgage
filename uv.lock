@@ -352,39 +352,6 @@ wheels = [
 ]
 
 [[package]]
-name = "hello-world"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "duckdb" },
-    { name = "ipython" },
-    { name = "quickgrove" },
-    { name = "scikit-learn" },
-    { name = "urllib3" },
-    { name = "xgboost" },
-    { name = "xorq" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "duckdb", specifier = ">=1.3.2" },
-    { name = "ipython", specifier = ">=9.4.0" },
-    { name = "quickgrove", specifier = ">=0.1.4" },
-    { name = "scikit-learn", specifier = ">=1.7.1" },
-    { name = "urllib3", specifier = ">=2.2.3" },
-    { name = "xgboost", specifier = ">=3.0.4" },
-    { name = "xorq", path = "dist/xorq-0.3.1-py3-none-any.whl" },
-]
-
-[package.metadata.requires-dev]
-dev = [{ name = "ruff", specifier = ">=0.6.7" }]
-
-[[package]]
 name = "idna"
 version = "3.10"
 source = { registry = "https://pypi.org/simple" }
@@ -1368,7 +1335,7 @@ dependencies = [
     { name = "xorq-datafusion" },
 ]
 wheels = [
-    { filename = "xorq-0.3.1-py3-none-any.whl", hash = "sha256:c34b6b2d0e57766f2be3ea39109d538170aa7ec2c85e5b4275624d9a51fda38d" },
+    { filename = "xorq-0.3.1-py3-none-any.whl", hash = "sha256:cd6e6666d176308d16f60bc5dbb7149f696314a8306aacff04acb919420ab3d4" },
 ]
 
 [package.metadata]
@@ -1443,6 +1410,39 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/e9/ae/2c3eeab8d3aaa2c933abc4827d1732af9906b9db04ceda1336a4d4d848ee/xorq_datafusion-0.2.3-cp38-abi3-win32.whl", hash = "sha256:a6fb2f49ced29530cfc29d8d783c1febbac77cd09cce0c8fb5805dd651612eb3", size = 26910464, upload-time = "2025-06-30T13:59:38.826Z" },
     { url = "https://files.pythonhosted.org/packages/9d/dd/de3c1faeb0254140de07876a3345cf85c6529af03159f52026de0bebb4e8/xorq_datafusion-0.2.3-cp38-abi3-win_amd64.whl", hash = "sha256:383c6f3f389ac72e5ea5ff502ac5b2b463565ebe7ec2ceaa659cfa23ee74001b", size = 29963631, upload-time = "2025-06-30T13:59:41.458Z" },
 ]
+
+[[package]]
+name = "xorq-sklearn-mortgage"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "duckdb" },
+    { name = "ipython" },
+    { name = "quickgrove" },
+    { name = "scikit-learn" },
+    { name = "urllib3" },
+    { name = "xgboost" },
+    { name = "xorq" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "duckdb", specifier = ">=1.3.2" },
+    { name = "ipython", specifier = ">=9.4.0" },
+    { name = "quickgrove", specifier = ">=0.1.4" },
+    { name = "scikit-learn", specifier = ">=1.7.1" },
+    { name = "urllib3", specifier = ">=2.2.3" },
+    { name = "xgboost", specifier = ">=3.0.4" },
+    { name = "xorq", path = "dist/xorq-0.3.1-py3-none-any.whl" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ruff", specifier = ">=0.6.7" }]
 
 [[package]]
 name = "zipp"
