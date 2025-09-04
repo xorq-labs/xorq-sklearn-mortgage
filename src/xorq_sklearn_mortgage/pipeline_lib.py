@@ -329,6 +329,27 @@ class MLPipelineResult:
     def model(self):
         return self.fitted_pipeline.predict_step.model
 
+    @property
+    @functools.cache
+    def quickgrove_udf(self):
+        from xorq_sklearn_mortgage.quickgrove_lib import (
+            mortgage_xgboost_to_quickgrove_udf,
+        )
+        quickgrove_udf = mortgage_xgboost_to_quickgrove_udf(self.model)
+        return quickgrove_udf
+
+    def predict_quickgrove(self, expr):
+        return (
+            expr
+            .pipe(self.process_expr)
+            .into_backend(self.ctx.con)
+            .pipe(self.fitted_onehot.transform)
+            .mutate(prediction=self.quickgrove_udf.on_expr)
+        )
+
+    def get_gropued_timers(self):
+        return toolz.valmap(lambda tpl: sum(v for k, v in tpl), toolz.groupby(lambda kv: kv[0].rsplit("-", 1)[0], Timer.timers.items()))
+
 
 def create_features(expr):
     return expr.mutate(

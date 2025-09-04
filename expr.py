@@ -1,38 +1,21 @@
 from attrs import evolve
+from codetiming import Timer
+
 from xorq_sklearn_mortgage.pipeline_lib import (
     ModelConfig,
     PipelineConfig,
     MLPipelineResult,
 )
-from xorq_sklearn_mortgage.quickgrove_lib import (
-    mortgage_xgboost_to_quickgrove_udf,
+
+
+config = PipelineConfig(
+    model=evolve(ModelConfig(), num_boost_round=50, max_depth=12),
 )
-
-
-def predict_new_data_with_quickgrove(
-    result: MLPipelineResult,
-    new_data_expr,
-):
-    udf = mortgage_xgboost_to_quickgrove_udf(result.model)
-    new_predicted = (
-        result.process_expr(new_data_expr)
-        .into_backend(result.ctx.con)
-        .pipe(result.fitted_onehot.transform)
-        # potential Filter to be pushed here
-        .cache(storage=result.storage)
-        # FIXME: If i try to cache wide table i get a `Compilation rule for
-        # `TableUnnest` operation is not defined` error
-        .mutate(prediction=udf.on_expr)
-    )
-    return new_predicted
-
-
-def main():
-    config = PipelineConfig(
-        model=evolve(ModelConfig(), num_boost_round=50, max_depth=12),
-    )
+with Timer("MLPipelineResult creation"):
     result = MLPipelineResult(config)
-    new_predictions_quickgrove = predict_new_data_with_quickgrove(
-        result, result.raw_expr,
-    )
-    return result, new_predictions_quickgrove
+with Timer("generate predict_quickgrove expr"):
+    # 30 seconds per 100k rows predicted
+    # # floor of 6 seconds because of duckdb join
+    expr = new_predictions_quickgrove = result.predict_quickgrove(result.raw_expr)
+with Timer("execute predictions"):
+    df = expr.limit(200_000).execute()
