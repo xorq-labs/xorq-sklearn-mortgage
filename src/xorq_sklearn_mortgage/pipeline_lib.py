@@ -22,6 +22,9 @@ from xorq.expr.ml import train_test_splits
 from xorq.expr.ml.structer import ENCODED
 
 
+default_filter_date = "2001-01-01"
+
+
 @frozen
 class ConnectionContext:
     con: Any = field()
@@ -38,7 +41,7 @@ class DataConfig:
     perf_rel_path: str = field(default="data/perf/perf.parquet")
     acq_rel_path: str = field(default="data/acq/acq.parquet")
     filter_date: str = field(
-        default="2001-01-01"
+        default=default_filter_date,
     )  # data that works without ArrowInvalid: offset overflow while concatenating arrays
 
     @property
@@ -60,9 +63,6 @@ class DataConfig:
             perf_expr, acq_expr.loan_id == perf_expr.loan_id, how="left"
         ).filter(xo._.monthly_reporting_period <= self.filter_date)
         return expr
-
-
-load_data = DataConfig.load_data
 
 
 @frozen
