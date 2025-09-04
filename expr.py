@@ -20,6 +20,7 @@ def predict_new_data_with_quickgrove(
     udf = mortgage_xgboost_to_quickgrove_udf(result.model)
     new_predicted = (
         result.process_expr(new_data_expr)
+        .into_backend(result.ctx.con)
         .pipe(result.fitted_onehot.transform)
         # potential Filter to be pushed here
         .cache(storage=result.storage)
