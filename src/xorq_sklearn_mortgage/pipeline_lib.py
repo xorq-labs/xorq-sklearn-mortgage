@@ -59,6 +59,7 @@ class DataConfig:
         acq_expr = xo.deferred_read_parquet(
             self.acq_path, ctx.duck_con, "acq_raw"
         )
+        # we need duckdb here: datafusion blows up memory, duckdb streams
         expr = acq_expr.join(
             perf_expr, acq_expr.loan_id == perf_expr.loan_id, how="left"
         ).filter(xo._.monthly_reporting_period <= self.filter_date)
@@ -154,7 +155,7 @@ class OneHotHelper(OneHotEncoder):
             deferred_fit_transform_sklearn,
             kwargs
             | {
-                "return_type": dt.Array(dt.Struct({"key": str, "value": float})),
+                "return_type": dt.Array(dt.Struct({"key": dt.LargeString(), "value": float})),
                 "target": None,
             },
         )
