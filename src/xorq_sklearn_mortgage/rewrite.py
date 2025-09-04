@@ -17,6 +17,9 @@ from xorq.vendor.ibis.common.annotations import Argument
 from xorq.vendor.ibis.common.patterns import pattern, replace
 from xorq.vendor.ibis.expr import operations as ops
 from xorq.vendor.ibis.expr.rules import ValueOf
+from xorq.vendor.ibis.util import Namespace
+from xorq.expr.ml.quickgrove_lib import SUPPORTED_TYPES
+from xorq_sklearn_mortgage.quickgrove_lib import make_df_cheap
 
 p = Namespace(pattern, module=ops)
 
@@ -24,7 +27,6 @@ p = Namespace(pattern, module=ops)
 def _validate_model_features(
     model: "PyGradientBoostedDecisionTrees", supported_types: Dict
 ) -> None:
-    """Raise an error if the model has unsupported feature types."""
     schema = [model.feature_names[i] for i in sorted(model.required_features)]
     feature_types = [model.feature_types[i] for i in sorted(model.required_features)]
     unsupported = [
@@ -40,10 +42,6 @@ def make_pruned_udf(
     original_udf,
     predicates: List[dict],
 ) -> UDFWrapper:
-    """
-    Create a new pruned UDF from an existing UDF and a list of predicates.
-    `original_udf` must have a `.model` attribute.
-    """
     from quickgrove import Feature
 
     model = original_udf.model
@@ -99,7 +97,6 @@ def make_pruned_udf(
                 typehint=dt.float64,
             )
 
-    # Always include ENCODED column
     fields[ENCODED] = Argument(
         pattern=ValueOf(dt.Array(dt.Struct({"key": dt.string, "value": dt.float64}))),
         typehint=dt.Array(dt.Struct({"key": dt.string, "value": dt.float64})),
@@ -109,24 +106,19 @@ def make_pruned_udf(
         if len(arrays) != len(fields):
             raise ValueError(f"Expected {len(fields)} arrays, got {len(arrays)}")
 
-        # Last array is always ENCODED
         encoded_array = arrays[-1]
         base_arrays = arrays[:-1]
 
-        # Create base DataFrame
         base_feature_names = [name for name in fields.keys() if name != ENCODED]
         base_df = pd.DataFrame(
             {feature: array for feature, array in zip(base_feature_names, base_arrays)}
         )
 
-        # Process encoded features
         encoded_series = pd.Series(encoded_array)
         onehot_df = make_df_cheap(encoded_series)
 
-        # Combine base and encoded features
         combined_df = pd.concat([base_df, onehot_df], axis=1)
 
-        # Prepare feature matrix for pruned model
         feature_matrix = pd.DataFrame()
         for feature in schema:
             if feature in combined_df.columns:
@@ -157,7 +149,6 @@ def make_pruned_udf(
 
 @replace(p.Filter(p.Project))
 def prune_quickgrove_model(_, **kwargs):
-    """Rewrite rule to prune quickgrove model based on filter predicates."""
     parent_op = _.parent
     predicates = collect_predicates(_)
     if not predicates:
@@ -168,7 +159,6 @@ def prune_quickgrove_model(_, **kwargs):
 
     for name, value in parent_op.values.items():
         if isinstance(value, ops.ScalarUDF) and hasattr(value, "model"):
-            # return filter op if predicates are not in filter
             if not _all_predicates_are_features(_, value.model):
                 return _
 
@@ -181,7 +171,6 @@ def prune_quickgrove_model(_, **kwargs):
                 if feat_name in parent_op.values
             }
 
-            # Apply the pruned UDF
             if callable(pruned_udf_wrapper):
                 new_values[name] = pruned_udf_wrapper(**udf_kwargs)
             else:
@@ -202,7 +191,6 @@ def prune_quickgrove_model(_, **kwargs):
 
 
 def rewrite_quickgrove_expr(expr) -> ir.Table:
-    """Rewrite an Ibis expression by pruning quickgrove models based on filter conditions."""
     op = expr.op()
     new_op = op.replace(prune_quickgrove_model)
     return new_op.to_expr()
