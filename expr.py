@@ -223,37 +223,20 @@ def predict_new_data_with_quickgrove(
     return new_predicted
 
 
-def create_mortgage_pipeline(config: PipelineConfig):
-    def execute_pipeline():
-        ctx = ConnectionContext.create()
-
-        load_data_fn = load_data(config.data, ctx)
-        clean_data_fn = clean_features(config.features)
-        split_data_fn = create_train_test_split(config, ctx)
-
-        return pipe(
-            load_data_fn,
-            create_features,
-            create_loan_summary,
-            clean_data_fn,
-            split_data_fn,
-            lambda split: fit_pipeline(config, split[0], split[1]),
-        )
-    return execute_pipeline
-
-
 def main():
-    data_root = pathlib.Path(os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))
-
     config = PipelineConfig(
-        data=DataConfig(data_root=data_root),
+        data=DataConfig(data_root=pathlib.Path(os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))),
         model=evolve(ModelConfig(), num_boost_round=50, max_depth=12),
     )
-
-    pipeline = create_mortgage_pipeline(config)
-    result = pipeline()
     ctx = ConnectionContext.create()
-
+    result = pipe(
+        config.data.load_data(ctx),
+        create_features,
+        create_loan_summary,
+        clean_features(config.features),
+        create_train_test_split(config, ctx),
+        lambda split: fit_pipeline(config, split[0], split[1]),
+    )
     return result, config, ctx
 
 
