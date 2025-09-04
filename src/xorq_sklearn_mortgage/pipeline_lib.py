@@ -186,16 +186,7 @@ class MortgageXGBoost(BaseEstimator):
     return_type = dt.float64
 
     def explode_encoded(self, X):
-        def make_df_apply(series):
-            df = (
-                series
-                .apply(
-                    lambda lst: pd.Series({d["key"]: d["value"] for d in lst})
-                )
-            )
-            return df
-
-        def make_df_expensive(series):
+        def make_df(series):
             (keys, values) = (
                 [
                     tuple(dct[which] for dct in lst)
@@ -212,20 +203,7 @@ class MortgageXGBoost(BaseEstimator):
             )
             return df
 
-        def make_df_cheap(series):
-            values = [
-                [dct["value"] for dct in lst]
-                for lst in series
-            ]
-            columns = [dct["key"] for dct in series.iloc[0]]
-            df = pd.DataFrame(
-                values,
-                index=series.index,
-                columns=columns,
-            )
-            return df
-
-        f = make_df_expensive
+        f = make_df
         with Timer(f"exlode_encoded-{f.__name__}-{threading.current_thread().native_id}", logger=None):
             return X.drop(columns=self.encoded_col).join(f(X[self.encoded_col]))
 
