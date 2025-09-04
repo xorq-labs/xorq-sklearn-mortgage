@@ -116,26 +116,18 @@ def create_train_test_split(config: PipelineConfig, ctx: ConnectionContext, expr
     return train_clean, test_clean
 
 
-def create_pipeline_steps(config: PipelineConfig):
-    one_hot_step = OneHotHelper.get_step()
-    xgb_step = MortgageXGBoost.get_step()
-    return one_hot_step, xgb_step
-
-
 def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
-    one_hot_step = OneHotHelper.get_step()
-    xgb_step = MortgageXGBoost.get_step(config)
     con = xo.connect()
     storage = ParquetStorage(source=con)
 
-    fitted_onehot = one_hot_step.fit(
+    fitted_onehot = OneHotHelper.get_step().fit(
         train_expr,
         features=config.features.categorical_features,
         dest_col=ENCODED,
         storage=storage,
     )
 
-    fitted_xgb = xgb_step.fit(
+    fitted_xgb = MortgageXGBoost.get_step(config).fit(
         expr=train_expr.mutate(fitted_onehot.mutate),
         features=list(config.features.numeric_features)
         + list(config.features.flag_features)
