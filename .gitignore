@@ -30,3 +30,5 @@ venv/
 .envrc.secrets
 scripts
 .direnv/*
+
+builds/*
