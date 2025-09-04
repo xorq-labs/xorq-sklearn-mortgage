@@ -69,13 +69,12 @@ class DataConfig:
 
 @frozen
 class FeatureConfig:
-    numeric_features: Tuple[str, ...] = field(
+    int_features: Tuple[str, ...] = field(
+        default=("orig_ltv", "dti", "credit_score", "orig_upb"),
+    )
+    float_features: Tuple[str, ...] = field(
         default=(
             "orig_rate",
-            "orig_ltv",
-            "dti",
-            "credit_score",
-            "orig_upb",
             "current_balance_ratio",
         )
     )
@@ -89,7 +88,29 @@ class FeatureConfig:
 
     @property
     def all_features(self) -> Tuple[str, ...]:
-        return self.numeric_features + self.categorical_features + self.flag_features
+        return self.int_features + self.float_features + self.categorical_features + self.flag_features
+
+    def select_available_features(self, expr):
+        available_features = tuple(f for f in self.all_features if f in expr.columns)
+        return expr.select(("loan_id",) + available_features + (self.target_col,))
+
+    def feature_fill_null(self, expr):
+        lookup = {
+            col: 0
+            for col in self.int_features + self.flag_features + (self.target_col,)
+        } | {
+            col: 0.0
+            for col in self.float_features
+        } | {
+            col: "Unknown"
+            for col in self.categorical_features
+        }
+        fill_null_exprs = {
+            col: getattr(xo._, col).fill_null(value).name(col)
+            for col, value in lookup.items()
+            if col in expr.columns
+        }
+        return expr.mutate(**fill_null_exprs)
 
 
 @frozen
@@ -258,15 +279,14 @@ class MLPipelineResult:
         return self.config.data.load_data(self.ctx)
 
     def process_expr(self, expr):
-        funcs = (
-            create_features,
-            create_loan_summary,
-            clean_features(self.config.features),
+        processed = (
+            expr
+            .mutate(*feature_mutations)
+            .group_by("loan_id").aggregate(*loan_id_aggregates)
+            .pipe(self.config.features.select_available_features)
+            .pipe(self.config.features.feature_fill_null)
         )
-        return toolz.pipe(
-            expr,
-            *funcs,
-        )
+        return processed
 
     @property
     @functools.cache
@@ -301,9 +321,7 @@ class MLPipelineResult:
 
         fitted_xgb = MortgageXGBoost.get_step(self.config).fit(
             expr=self.train_expr.mutate(fitted_onehot.mutate),
-            features=list(self.config.features.numeric_features)
-            + list(self.config.features.flag_features)
-            + [ENCODED],
+            features=self.config.features.int_features + self.config.features.float_features + self.config.features.flag_features + (ENCODED,),
             target=self.config.features.target_col,
             dest_col="predicted_prob",
             storage=self.storage,
@@ -351,65 +369,31 @@ class MLPipelineResult:
         return toolz.valmap(lambda tpl: sum(v for k, v in tpl), toolz.groupby(lambda kv: kv[0].rsplit("-", 1)[0], Timer.timers.items()))
 
 
-def create_features(expr):
-    return expr.mutate(
-        [
-            xo._.current_loan_delinquency_status.fillna(0).name("delinq_status"),
-            xo._.dti.fillna(0).name("dti"),
-            xo._.borrower_credit_score.fillna(650).name("credit_score"),
-            (xo._.orig_ltv > 80).name("high_ltv"),
-            (xo._.dti > 43).name("high_dti"),
-            (xo._.borrower_credit_score < 620).name("subprime"),
-            (xo._.current_actual_upb / xo._.orig_upb).name("balance_ratio"),
-            (xo._.current_loan_delinquency_status >= 3).name("target_delinquent"),
-        ]
-    )
+feature_mutations = (
+    xo._.current_loan_delinquency_status.fillna(0).name("delinq_status"),
+    xo._.dti.fillna(0).name("dti"),
+    xo._.borrower_credit_score.fillna(650).name("credit_score"),
+    (xo._.orig_ltv > 80).name("high_ltv"),
+    (xo._.dti > 43).name("high_dti"),
+    (xo._.borrower_credit_score < 620).name("subprime"),
+    (xo._.current_actual_upb / xo._.orig_upb).name("balance_ratio"),
+    (xo._.current_loan_delinquency_status >= 3).name("target_delinquent"),
+)
 
 
-def create_loan_summary(expr):
-    return expr.group_by("loan_id").aggregate(
-        [
-            xo._.orig_interest_rate.first().name("orig_rate"),
-            xo._.orig_ltv.first().cast("float64").name("orig_ltv"),
-            xo._.dti.first().cast("float64").name("dti"),
-            xo._.credit_score.first().cast("float64").name("credit_score"),
-            xo._.orig_upb.first().cast("float64").name("orig_upb"),
-            xo._.property_state.first().name("property_state"),
-            xo._.loan_purpose.first().name("loan_purpose"),
-            xo._.property_type.first().name("property_type"),
-            xo._.delinq_status.max().cast("float64").name("max_delinquency"),
-            xo._.target_delinquent.max().cast("float64").name("ever_90_delinq"),
-            xo._.balance_ratio.last().name("current_balance_ratio"),
-            xo._.high_ltv.any().cast("float64").name("high_ltv_flag"),
-            xo._.high_dti.any().cast("float64").name("high_dti_flag"),
-            xo._.subprime.any().cast("float64").name("subprime_flag"),
-        ]
-    )
-
-
-@toolz.curry
-def clean_features(config: FeatureConfig, expr):
-    mutate_exprs = []
-
-    for col in config.numeric_features:
-        if col in expr.columns:
-            fill_value = (
-                0 if col in ["orig_ltv", "dti", "credit_score", "orig_upb"] else 0.0
-            )
-            mutate_exprs.append(getattr(xo._, col).fill_null(fill_value).name(col))
-
-    for col in config.categorical_features:
-        if col in expr.columns:
-            mutate_exprs.append(getattr(xo._, col).fill_null("Unknown").name(col))
-
-    for col in config.flag_features:
-        if col in expr.columns:
-            mutate_exprs.append(getattr(xo._, col).fill_null(0).name(col))
-
-    mutate_exprs.append(xo._[config.target_col].fill_null(0).name(config.target_col))
-
-    available_features = [f for f in config.all_features if f in expr.columns]
-
-    return expr.select(["loan_id"] + available_features + [config.target_col]).mutate(
-        mutate_exprs
-    )
+loan_id_aggregates = (
+    xo._.orig_interest_rate.first().name("orig_rate"),
+    xo._.orig_ltv.first().cast("float64").name("orig_ltv"),
+    xo._.dti.first().cast("float64").name("dti"),
+    xo._.credit_score.first().cast("float64").name("credit_score"),
+    xo._.orig_upb.first().cast("float64").name("orig_upb"),
+    xo._.property_state.first().name("property_state"),
+    xo._.loan_purpose.first().name("loan_purpose"),
+    xo._.property_type.first().name("property_type"),
+    xo._.delinq_status.max().cast("float64").name("max_delinquency"),
+    xo._.target_delinquent.max().cast("float64").name("ever_90_delinq"),
+    xo._.balance_ratio.last().name("current_balance_ratio"),
+    xo._.high_ltv.any().cast("float64").name("high_ltv_flag"),
+    xo._.high_dti.any().cast("float64").name("high_dti_flag"),
+    xo._.subprime.any().cast("float64").name("subprime_flag"),
+)
