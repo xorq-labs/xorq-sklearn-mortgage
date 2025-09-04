@@ -1,9 +1,8 @@
+import functools
 import os
 import pathlib
-from typing import Any
 
 import xorq.api as xo
-import xorq.expr.datatypes as dt
 from attrs import evolve, field, frozen
 from toolz import curry, pipe
 from xorq.caching import ParquetStorage
@@ -28,12 +27,88 @@ from xorq_sklearn_mortgage.quickgrove_lib import (
 
 @frozen
 class MLPipelineResult:
-    train_expr: Any = field()
-    test_expr: Any = field()
-    fitted_pipeline: FittedPipeline = field()
-    predictions: Any = field()
-    model: Any = field()
-    deferred_model: Any = field(default=None)
+    config = field()
+    ctx = field(init=False, factory=ConnectionContext.create)
+
+    @property
+    @functools.cache
+    def storage(self):
+        return ParquetStorage(source=self.ctx.con)
+
+    @property
+    @functools.cache
+    def raw_expr(self):
+        return self.config.data.load_data(self.ctx)
+
+    def process_expr(self, expr):
+        funcs = (
+            create_features,
+            create_loan_summary,
+            clean_features(self.config.features),
+        )
+        return pipe(
+            expr,
+            *funcs,
+        )
+
+    @property
+    @functools.cache
+    def train_test_split(self):
+        (train_expr, test_expr) = (
+            expr.drop("row_id").cache(storage=self.storage)
+            for expr in train_test_splits(
+                self.process_expr(self.raw_expr).mutate(row_id=xo.row_number()),
+                "row_id",
+                **self.config.split.split_kwargs,
+            )
+        )
+        return train_expr, test_expr
+
+    @property
+    def train_expr(self):
+        return self.train_test_split[0]
+
+    @property
+    def test_expr(self):
+        return self.train_test_split[1]
+
+    @property
+    def fitted_pipeline(self):
+        fitted_onehot = OneHotHelper.get_step().fit(
+            self.train_expr,
+            features=self.config.features.categorical_features,
+            dest_col=ENCODED,
+            storage=self.storage,
+        )
+
+        fitted_xgb = MortgageXGBoost.get_step(self.config).fit(
+            expr=self.train_expr.mutate(fitted_onehot.mutate),
+            features=list(self.config.features.numeric_features)
+            + list(self.config.features.flag_features)
+            + [ENCODED],
+            target=self.config.features.target_col,
+            dest_col="predicted_prob",
+            storage=self.storage,
+        )
+        fitted_pipeline = FittedPipeline((fitted_onehot, fitted_xgb), self.train_expr)
+        return fitted_pipeline
+
+    @property
+    def predictions(self):
+        predictions = self.fitted_pipeline.predict(self.test_expr).mutate(
+            predicted_class=(xo._.predicted_prob >= self.config.model.prediction_threshold).cast(
+                "int"
+            )
+        )
+        return predictions
+
+    @property
+    def model(self):
+        return self.fitted_pipeline.predict_step.model
+
+    @property
+    def deferred_model(self):
+        raise NotImplementedError
 
 
 def create_features(expr):
@@ -100,60 +175,6 @@ def clean_features(config: FeatureConfig, expr):
     )
 
 
-@curry
-def create_train_test_split(config: PipelineConfig, ctx: ConnectionContext, expr):
-    ml_with_row = expr.mutate(row_id=xo.row_number())
-    train_expr, test_expr = train_test_splits(
-        ml_with_row,
-        "row_id",
-        **config.split.split_kwargs,
-    )
-
-    storage = ParquetStorage(source=ctx.con)
-    train_clean = train_expr.drop("row_id").cache(storage=storage)
-    test_clean = test_expr.drop("row_id").cache(storage=storage)
-
-    return train_clean, test_clean
-
-
-def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
-    con = xo.connect()
-    storage = ParquetStorage(source=con)
-
-    fitted_onehot = OneHotHelper.get_step().fit(
-        train_expr,
-        features=config.features.categorical_features,
-        dest_col=ENCODED,
-        storage=storage,
-    )
-
-    fitted_xgb = MortgageXGBoost.get_step(config).fit(
-        expr=train_expr.mutate(fitted_onehot.mutate),
-        features=list(config.features.numeric_features)
-        + list(config.features.flag_features)
-        + [ENCODED],
-        target=config.features.target_col,
-        dest_col="predicted_prob",
-        storage=storage,
-    )
-
-    pipeline = FittedPipeline((fitted_onehot, fitted_xgb), train_expr)
-
-    predictions = pipeline.predict(test_expr).mutate(
-        predicted_class=(xo._.predicted_prob >= config.model.prediction_threshold).cast(
-            "int"
-        )
-    )
-    return MLPipelineResult(
-        train_expr=train_expr,
-        test_expr=test_expr,
-        fitted_pipeline=pipeline,
-        predictions=predictions,
-        model=fitted_xgb.model,
-        deferred_model=fitted_xgb.model_udf,
-    )
-
-
 def predict_new_data_with_quickgrove(
     result: MLPipelineResult,
     new_data_expr,
@@ -187,15 +208,8 @@ def main():
         data=DataConfig(data_root=pathlib.Path(os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))),
         model=evolve(ModelConfig(), num_boost_round=50, max_depth=12),
     )
-    ctx = ConnectionContext.create()
-    result = pipe(
-        config.data.load_data(ctx),
-        create_features,
-        create_loan_summary,
-        clean_features(config.features),
-        create_train_test_split(config, ctx),
-        lambda split: fit_pipeline(config, split[0], split[1]),
-    )
+    result = MLPipelineResult(config)
+    ctx = result.ctx
     return result, config, ctx
 
 
