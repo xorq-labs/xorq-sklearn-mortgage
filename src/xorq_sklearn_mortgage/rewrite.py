@@ -5,6 +5,7 @@ import pandas as pd
 import xorq.expr.datatypes as dt
 import xorq.vendor.ibis.expr.types as ir
 from xorq.expr.ml.quickgrove_lib import (
+    SUPPORTED_TYPES,
     UDFWrapper,
     _all_predicates_are_features,
     _create_udf_function,
@@ -18,7 +19,7 @@ from xorq.vendor.ibis.common.patterns import pattern, replace
 from xorq.vendor.ibis.expr import operations as ops
 from xorq.vendor.ibis.expr.rules import ValueOf
 from xorq.vendor.ibis.util import Namespace
-from xorq.expr.ml.quickgrove_lib import SUPPORTED_TYPES
+
 from xorq_sklearn_mortgage.quickgrove_lib import make_df_cheap
 
 p = Namespace(pattern, module=ops)
