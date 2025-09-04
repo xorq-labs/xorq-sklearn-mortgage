@@ -73,6 +73,7 @@ class MLPipelineResult:
         return self.train_test_split[1]
 
     @property
+    @functools.cache
     def fitted_pipeline(self):
         fitted_onehot = OneHotHelper.get_step().fit(
             self.train_expr,
@@ -94,6 +95,11 @@ class MLPipelineResult:
         return fitted_pipeline
 
     @property
+    def fitted_onehot(self):
+        (fitted_onehot,) = self.fitted_pipeline.transform_steps
+        return fitted_onehot
+
+    @property
     def predictions(self):
         predictions = self.fitted_pipeline.predict(self.test_expr).mutate(
             predicted_class=(xo._.predicted_prob >= self.config.model.prediction_threshold).cast(
@@ -105,10 +111,6 @@ class MLPipelineResult:
     @property
     def model(self):
         return self.fitted_pipeline.predict_step.model
-
-    @property
-    def deferred_model(self):
-        raise NotImplementedError
 
 
 def create_features(expr):
@@ -178,28 +180,18 @@ def clean_features(config: FeatureConfig, expr):
 def predict_new_data_with_quickgrove(
     result: MLPipelineResult,
     new_data_expr,
-    config: PipelineConfig,
-    ctx: ConnectionContext,
 ):
-    processed_new_data = pipe(
-        new_data_expr,
-        create_features,
-        create_loan_summary,
-        lambda expr: clean_features(config.features, expr),
-    )
-
     udf = mortgage_xgboost_to_quickgrove_udf(result.model)
-
-    fitted_onehot = result.fitted_pipeline.fitted_steps[0]
-    t = (
-        fitted_onehot.transform(processed_new_data).cache(
-            storage=ParquetStorage(source=ctx.con)
+    new_predicted = (
+        result.process_expr(new_data_expr)
+        .pipe(result.fitted_onehot.transform)
+        .cache(
+            storage=ParquetStorage(source=result.ctx.con)
         )  # potential Filter to be pushed here
+        # FIXME: If i try to cache wide table i get a `Compilation rule for
+        # `TableUnnest` operation is not defined` error
+        .mutate(prediction=udf.on_expr)
     )
-    # FIXME: If i try to cache wide table i get a `Compilation rule for
-    # `TableUnnest` operation is not defined` error
-    new_predicted = t.mutate(prediction=udf.on_expr)
-
     return new_predicted
 
 
@@ -209,23 +201,7 @@ def main():
         model=evolve(ModelConfig(), num_boost_round=50, max_depth=12),
     )
     result = MLPipelineResult(config)
-    ctx = result.ctx
-    return result, config, ctx
-
-
-def example_new_data_prediction_with_xgboost_udf():
-    result, config, ctx = main()
-
-    new_data_expr = load_data(evolve(config.data, filter_date=C.filter_date), ctx).cache(
-        storage=ParquetStorage(source=ctx.con)
-    )
-
     new_predictions_quickgrove = predict_new_data_with_quickgrove(
-        result, new_data_expr, config, ctx
+        result, result.raw_expr,
     )
-
-    dct = {
-        "quickgrove": new_predictions_quickgrove,
-    }
-    # df = pd.DataFrame({k: v.execute().set_index("loan_id")["prediction"] for k, v in dct.items()})
-    return dct
+    return result, new_predictions_quickgrove
