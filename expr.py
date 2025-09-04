@@ -154,47 +154,6 @@ def fit_pipeline(config: PipelineConfig, train_expr, test_expr):
     )
 
 
-def create_quickgrove_predictions(result: MLPipelineResult, ctx: ConnectionContext):
-    udf = mortgage_xgboost_to_quickgrove_udf(result.model)
-
-    fitted_onehot = result.fitted_pipeline.fitted_steps[0]
-
-    t = fitted_onehot.transform(result.test_expr).cache(
-        storage=ParquetStorage(source=ctx.con)
-    )
-
-    test_predicted = t.mutate(prediction=udf.on_expr)
-
-    return evolve(result, predictions=test_predicted)
-
-
-def predict_new_data(result: MLPipelineResult, new_data_expr, config: PipelineConfig):
-    # sklearn prediction
-
-    # this takes a long time
-    processed_new_data = (
-        pipe(
-            new_data_expr,
-            create_features,
-            create_loan_summary,
-            lambda expr: clean_features(
-                config.features, expr
-            ),  # spurious into_backend?
-        ).into_backend(con=xo.connect())
-        # if I remove it I get InvalidInputException: Invalid Input Error:
-        # Python exception occurred while executing the UDF: ValueError: Caller
-        # must bind computed_arg to the output of computed_kwargs_expr
-    )
-
-    new_predictions = result.fitted_pipeline.predict(processed_new_data).mutate(
-        predicted_class=(xo._.predicted_prob >= config.model.prediction_threshold).cast(
-            "int"
-        )
-    )
-
-    return new_predictions
-
-
 def predict_new_data_with_quickgrove(
     result: MLPipelineResult,
     new_data_expr,
