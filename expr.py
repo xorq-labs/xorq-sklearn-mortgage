@@ -1,9 +1,5 @@
-import os
-import pathlib
-
 from attrs import evolve
 from xorq_sklearn_mortgage.pipeline_lib import (
-    DataConfig,
     ModelConfig,
     PipelineConfig,
     MLPipelineResult,
@@ -33,7 +29,6 @@ def predict_new_data_with_quickgrove(
 
 def main():
     config = PipelineConfig(
-        data=DataConfig(data_root=pathlib.Path(os.getenv("DATA_ROOT", "/mnt/data/fanniemae"))),
         model=evolve(ModelConfig(), num_boost_round=50, max_depth=12),
     )
     result = MLPipelineResult(config)
