@@ -18,7 +18,7 @@ from xorq.expr.ml.structer import ENCODED
 from xorq.vendor.ibis.common.annotations import Argument
 from xorq.vendor.ibis.expr.rules import ValueOf
 
-from xorq_sklearn_mortgage.lib import (
+from xorq_sklearn_mortgage.pipeline_lib import (
     ConnectionContext,
     DataConfig,
     FeatureConfig,
