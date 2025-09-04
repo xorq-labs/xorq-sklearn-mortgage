@@ -1,4 +1,5 @@
 import functools
+import operator
 import os
 import pathlib
 from typing import Tuple, Dict, Any
@@ -169,6 +170,9 @@ class OneHotHelper(OneHotEncoder):
         )
 
 
+get_thread_native_id = toolz.compose(operator.attrgetter("native_id"), threading.current_thread)
+
+
 class MortgageXGBoost(BaseEstimator):
     def __init__(self, num_boost_round=100, encoded_col=ENCODED, **params):
         self.num_boost_round = num_boost_round
@@ -204,20 +208,20 @@ class MortgageXGBoost(BaseEstimator):
             return df
 
         f = make_df
-        with Timer(f"exlode_encoded-{f.__name__}-{threading.current_thread().native_id}", logger=None):
+        with Timer(f"exlode_encoded-{get_thread_native_id()}", logger=None):
             return X.drop(columns=self.encoded_col).join(f(X[self.encoded_col]))
 
     def fit(self, X, y):
         self.feature_names = X.columns
         X_exploded = self.explode_encoded(X)
-        with Timer(f"MortgageXGBoost.fit-{threading.current_thread().native_id}", logger=None):
+        with Timer(f"MortgageXGBoost.fit-{get_thread_native_id()}", logger=None):
             dtrain = xgb.DMatrix(X_exploded, y)
             self.model = xgb.train(self.params, dtrain, self.num_boost_round)
             return self
 
     def predict(self, X):
         X_exploded = self.explode_encoded(X)
-        with Timer(f"MortgageXGBoost.predict-{threading.current_thread().native_id}", logger=None):
+        with Timer(f"MortgageXGBoost.predict-{get_thread_native_id()}", logger=None):
             return self.model.predict(xgb.DMatrix(X_exploded))
 
     @classmethod
