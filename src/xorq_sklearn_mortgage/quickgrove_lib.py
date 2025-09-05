@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Union
 
+import dask
 import pandas as pd
 import xorq.expr.datatypes as dt
 from quickgrove import PyGradientBoostedDecisionTrees
@@ -124,3 +125,13 @@ def make_quickgrove_udf(
         model_path=model_path,
         required_features=required_features,
     )
+
+
+@dask.base.normalize_token.register(PyGradientBoostedDecisionTrees)
+def normalize_token_PyGradientBoostedDecisionTrees(obj):
+    import itertools
+    import toolz
+
+    f = toolz.excepts(Exception, obj.tree_info)
+    gen = itertools.takewhile(bool, (f(i) for i in itertools.count()))
+    return dask.base.tokenize(tuple(str(el) for el in gen))

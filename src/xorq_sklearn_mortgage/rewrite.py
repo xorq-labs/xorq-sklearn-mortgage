@@ -103,14 +103,14 @@ def make_pruned_udf(
         typehint=dt.Array(dt.Struct({"key": dt.string, "value": dt.float64})),
     )
 
-    def fn_from_arrays(*arrays):
-        if len(arrays) != len(fields):
-            raise ValueError(f"Expected {len(fields)} arrays, got {len(arrays)}")
+    def fn_from_arrays(*arrays, field_names=tuple(fields)):
+        if len(arrays) != len(field_names):
+            raise ValueError(f"Expected {len(field_names)} arrays, got {len(arrays)}")
 
         encoded_array = arrays[-1]
         base_arrays = arrays[:-1]
 
-        base_feature_names = [name for name in fields.keys() if name != ENCODED]
+        base_feature_names = [name for name in field_names if name != ENCODED]
         base_df = pd.DataFrame(
             {feature: array for feature, array in zip(base_feature_names, base_arrays)}
         )
